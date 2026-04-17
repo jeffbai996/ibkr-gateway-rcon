@@ -44,6 +44,13 @@ class GatewayConfig:
     port: int
     restart_cmd: str
     skip_file: Path
+    # Optional lifecycle commands. stop_cmd is what /gateway stop runs.
+    # start_cmd is what /gateway restart falls back to when the port is
+    # already down (no point "restarting" a dead gateway — start it cold).
+    # If stop_cmd or start_cmd is None, those operations are disabled and
+    # /gateway restart always runs restart_cmd.
+    stop_cmd: Optional[str] = None
+    start_cmd: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,8 @@ def load_config(path: Path) -> Config:
                 port=int(entry["port"]),
                 restart_cmd=entry["restart_cmd"],
                 skip_file=skip_file,
+                stop_cmd=entry.get("stop_cmd"),
+                start_cmd=entry.get("start_cmd"),
             )
         )
 
@@ -387,25 +396,66 @@ def resume(gw: GatewayConfig) -> None:
     clear_skip(gw.skip_file)
 
 
-def restart(gw: GatewayConfig, timeout: int = 240) -> subprocess.CompletedProcess:
-    """Fire the configured restart command. Returns CompletedProcess for callers
-    that want exit code / stdout. Does NOT raise on non-zero exit.
-
-    Default 240s timeout — IBKR gateway cold restarts can take ~2-3 minutes
-    because of IBKey auth + gateway JVM warmup. A tighter timeout would
-    interrupt legitimate restarts.
-    """
+def _run(cmd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run a shell command with a timeout, wrapping TimeoutExpired into a
+    returncode=-1 CompletedProcess instead of raising."""
     try:
         return subprocess.run(
-            gw.restart_cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout
         )
     except subprocess.TimeoutExpired as e:
         return subprocess.CompletedProcess(
-            args=gw.restart_cmd,
+            args=cmd,
             returncode=-1,
             stdout=(e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")),
-            stderr=f"restart timed out after {timeout}s",
+            stderr=f"command timed out after {timeout}s",
         )
+
+
+def restart(gw: GatewayConfig, timeout: int = 240) -> subprocess.CompletedProcess:
+    """Fire the restart command. IBKR gateway cold restarts can take ~2-3
+    minutes because of IBKey auth + gateway JVM warmup."""
+    return _run(gw.restart_cmd, timeout=timeout)
+
+
+def start(gw: GatewayConfig, timeout: int = 240) -> Optional[subprocess.CompletedProcess]:
+    """Fire the start command if configured. Returns None if no start_cmd
+    is defined (caller should fall back to restart)."""
+    if not gw.start_cmd:
+        return None
+    return _run(gw.start_cmd, timeout=timeout)
+
+
+def stop(gw: GatewayConfig, timeout: int = 60) -> Optional[subprocess.CompletedProcess]:
+    """Fire the stop command if configured. Returns None if no stop_cmd
+    is defined."""
+    if not gw.stop_cmd:
+        return None
+    return _run(gw.stop_cmd, timeout=timeout)
+
+
+def smart_restart(
+    gw: GatewayConfig,
+    port_listening: Callable[[int], bool],
+    restart_timeout: int = 240,
+    start_timeout: int = 240,
+) -> subprocess.CompletedProcess:
+    """If the gateway is already running, run restart. If it's stopped, run
+    start (falling back to restart if no start_cmd is configured). This is
+    what /gateway restart actually calls — 'restart' is the user's mental
+    model regardless of whether we need start or restart semantics.
+
+    Returns the CompletedProcess of whichever command ran.
+    """
+    if port_listening(gw.port):
+        return restart(gw, timeout=restart_timeout)
+    # Port is down — prefer cold start if configured.
+    started = start(gw, timeout=start_timeout)
+    if started is not None:
+        return started
+    # No start_cmd — fall back to restart. Many IBC restart scripts work
+    # from cold too, so this is usually fine.
+    return restart(gw, timeout=restart_timeout)
 
 
 def tail_log(log_path: Path, n: int = 20) -> list[str]:

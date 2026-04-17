@@ -12,10 +12,17 @@ gateways:
   - name: primary
     port: 4001
     restart_cmd: "echo 'replace with your restart command, e.g. cmd.exe /c RestartGateway_primary.bat'"
+    # Optional. If set, /gateway stop is available and /gateway restart will
+    # cold-start a gateway that's currently down instead of running restart
+    # on a dead process.
+    stop_cmd: "echo 'replace with your stop command, e.g. cmd.exe /c Stop.bat'"
+    start_cmd: "echo 'replace with your start command, e.g. cmd.exe /c StartGateway.bat'"
     skip_file: primary.skip
   - name: secondary
     port: 4002
     restart_cmd: "echo 'replace with your restart command'"
+    stop_cmd: "echo 'replace with your stop command'"
+    start_cmd: "echo 'replace with your start command'"
     skip_file: secondary.skip
 
 # How the watchdog detects whether a port is listening.
