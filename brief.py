@@ -240,13 +240,27 @@ def _today_trades_brief(trades_md: str, max_lines: int = 6) -> list[str]:
 
 def _money_cad(n: float) -> str:
     """Money formatter for values known to be in CAD. Strips the ccy suffix
-    since the whole brief is single-currency."""
+    since the whole brief is single-currency. Default 2 decimal places on M,
+    1 on k."""
     sign = "-" if n < 0 else ""
     a = abs(n)
     if a >= 1_000_000:
         return f"{sign}${a/1_000_000:.2f}M"
     if a >= 1_000:
         return f"{sign}${a/1_000:.1f}k"
+    return f"{sign}${a:.0f}"
+
+
+def _money_cad_hi(n: float) -> str:
+    """Higher-precision variant — one extra decimal place. Used for the
+    account-level headline numbers (NLV, day P&L, liq, bp) where Jeff wants
+    finer resolution."""
+    sign = "-" if n < 0 else ""
+    a = abs(n)
+    if a >= 1_000_000:
+        return f"{sign}${a/1_000_000:.3f}M"
+    if a >= 1_000:
+        return f"{sign}${a/1_000:.2f}k"
     return f"{sign}${a:.0f}"
 
 
@@ -266,11 +280,21 @@ def build_brief(data: BriefData, top_n: int = 5) -> str:
     if data.summary:
         combined_nlv = data.summary.get("combined_nlv")
         if combined_nlv is not None:
-            lines.append(f"NLV  {_money_cad(combined_nlv)}")
+            # Headline NLV gets the extra decimal.
+            lines.append(f"NLV  {_money_cad_hi(combined_nlv)}")
             lines.append("")
 
         for acct in data.summary.get("accounts", []):
             acct_id = acct["account"]
+            # If the MCP couldn't get this account's summary (e.g. subscription
+            # stale), surface that honestly instead of showing $0 / CRIT.
+            if acct.get("error") or acct.get("nlv") is None:
+                lines.append(f"{acct_id}")
+                err = acct.get("error", "data unavailable")
+                lines.append(f"  ⚠️ {err}")
+                lines.append("")
+                continue
+
             nlv = acct.get("nlv", 0)
             cushion = acct.get("cushion_pct", 0)
             lev = acct.get("leverage", 0)
@@ -280,12 +304,14 @@ def build_brief(data: BriefData, top_n: int = 5) -> str:
             pnl_tuple = _extract_daily_pnl(data.pnl_by_account.get(acct_id, ""))
 
             lines.append(f"{acct_id}")
-            lines.append(f"  nlv     {_money_cad(nlv)}")
+            # Account-level headlines use the higher-precision formatter.
+            lines.append(f"  nlv     {_money_cad_hi(nlv)}")
             if pnl_tuple:
                 dollars, pct = pnl_tuple
-                lines.append(f"  day     {_money_cad(dollars)} ({_pct(pct)})")
-            lines.append(f"  liq     {_money_cad(liq)}")
-            lines.append(f"  bp      {_money_cad(bp)}")
+                lines.append(f"  day     {_money_cad_hi(dollars)} ({_pct(pct)})")
+            lines.append(f"  liq     {_money_cad_hi(liq)}")
+            lines.append(f"  bp      {_money_cad_hi(bp)}")
+            # Cash is often negative and large — default precision is fine.
             lines.append(f"  cash    {_money_cad(cash)}")
             cushion_tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
             lines.append(f"  cushion {cushion:.1f}% ({cushion_tag})")
@@ -415,38 +441,59 @@ def _fmt_age(seconds: float) -> str:
 
 
 def build_health(data: HealthData, now: datetime) -> str:
-    """Mobile-friendly health wrapped in a code block."""
+    """Mobile-friendly health with readable labels."""
     lines: list[str] = ["```"]
 
-    # Heartbeat
+    # Watchdog heartbeat
     if data.heartbeat_age_s is None:
-        lines.append("heartbeat  MISSING")
+        lines.append("watchdog: heartbeat MISSING")
     else:
         max_healthy = data.watchdog_interval_s * 2
-        tag = "ok" if data.heartbeat_age_s < max_healthy else "STALE"
-        lines.append(f"heartbeat  {_fmt_age(data.heartbeat_age_s)} ago ({tag})")
-    lines.append(f"interval   {data.watchdog_interval_s}s")
+        if data.heartbeat_age_s < max_healthy:
+            lines.append(
+                f"watchdog: healthy ({_fmt_age(data.heartbeat_age_s)} ago, "
+                f"ticks every {data.watchdog_interval_s}s)"
+            )
+        else:
+            lines.append(
+                f"watchdog: STALE ({_fmt_age(data.heartbeat_age_s)} ago — "
+                f"expected every {data.watchdog_interval_s}s)"
+            )
     lines.append("")
 
     for i, st in enumerate(data.gateways):
         if i > 0:
             lines.append("")
-        state = "UP" if st.up else "DOWN"
+        state = "running" if st.up else "stopped"
         lines.append(f"{st.name} (port {st.port})")
-        lines.append(f"  state     {state}")
+        lines.append(f"  state:   {state}")
+
         if st.skipped:
             if st.skipped_until is None:
-                lines.append(f"  paused    indefinite")
+                lines.append(f"  watchdog paused indefinitely")
             else:
                 delta = (st.skipped_until - now).total_seconds()
-                lines.append(f"  paused    {_fmt_age(max(delta, 0))} left")
+                if delta <= 0:
+                    lines.append(f"  watchdog paused (expiring)")
+                elif delta < 60:
+                    lines.append(f"  watchdog paused for {int(delta)}s more")
+                elif delta < 3600:
+                    lines.append(f"  watchdog paused for {int(delta/60)}m more")
+                elif delta < 86400:
+                    lines.append(f"  watchdog paused for {delta/3600:.1f}h more")
+                else:
+                    lines.append(f"  watchdog paused for {delta/86400:.1f}d more")
         else:
-            lines.append(f"  paused    no")
+            lines.append(f"  watchdog active")
+
         restarts = data.restarts_last_24h.get(st.name, 0)
         last = data.last_restart_per_gateway.get(st.name)
-        last_str = "never" if last is None else f"{_fmt_age((now - last).total_seconds())} ago"
-        lines.append(f"  24h rest  {restarts}")
-        lines.append(f"  last      {last_str}")
+        if last is None:
+            lines.append(f"  no restarts on record")
+        else:
+            delta = (now - last).total_seconds()
+            lines.append(f"  last restart {_fmt_age(delta)} ago")
+        lines.append(f"  restarts in last 24h: {restarts}")
 
     lines.append("```")
     return "\n".join(lines)
