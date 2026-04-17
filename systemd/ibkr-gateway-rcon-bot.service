@@ -1,0 +1,18 @@
+[Unit]
+Description=IBKR Gateway RCON Discord Bot (in-process watchdog)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/repos/ibkr-gateway-rcon
+# Edit GATEWAY_RCON_CONFIG below to point at your real config.yaml path.
+Environment="GATEWAY_RCON_CONFIG=%h/repos/ibkr-gateway-rcon/config.yaml"
+ExecStart=%h/repos/ibkr-gateway-rcon/venv/bin/python3 %h/repos/ibkr-gateway-rcon/discord_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:%h/repos/ibkr-gateway-rcon/bot.log
+StandardError=append:%h/repos/ibkr-gateway-rcon/bot.log
+
+[Install]
+WantedBy=default.target

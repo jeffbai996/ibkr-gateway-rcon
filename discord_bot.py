@@ -1,4 +1,4 @@
-"""Discord slash-command front end for gateway control.
+"""Discord slash-command front end for gateway control + in-process watchdog.
 
 Exposes:
     /gateway status
@@ -6,6 +6,18 @@ Exposes:
     /gateway resume   <name>
     /gateway restart  <name>
     /gateway tail     [n]
+
+In addition to the slash-command UI, this bot runs the watchdog logic
+internally via a background task that ticks every WATCHDOG_INTERVAL_SEC
+seconds (default 180). Each tick:
+
+  1. Probes every gateway port
+  2. Checks skip-files
+  3. Fires restart commands for any gateway that's down and not paused
+  4. Touches a heartbeat file
+
+The heartbeat is consumed by the deadman's switch (see deadman.py) to detect a
+stuck or crashed bot and restart the service.
 
 Commands are guild-scoped to keep them out of DMs and other servers. An
 optional CHANNEL_ID env var restricts where the bot will respond — if set, the
@@ -26,6 +38,7 @@ from typing import Optional
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 import gateway_ctl as gc
@@ -73,6 +86,28 @@ def _choices(cfg: gc.Config) -> list[app_commands.Choice[str]]:
     return [app_commands.Choice(name=g.name, value=g.name) for g in cfg.gateways]
 
 
+def _watchdog_interval() -> int:
+    try:
+        return int(os.environ.get("WATCHDOG_INTERVAL_SEC", "180"))
+    except ValueError:
+        return 180
+
+
+def _heartbeat_path(cfg: gc.Config) -> Path:
+    return cfg.state_dir / "bot.heartbeat"
+
+
+def _log_append(log_path: Path, line: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as f:
+        f.write(line.rstrip() + "\n")
+
+
+def _watchdog_log(cfg: gc.Config, message: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    _log_append(cfg.log_file, f"{ts} — {message}")
+
+
 def build_bot() -> discord.Client:
     cfg = _load_cfg()
     allowed_channel = os.environ.get("DISCORD_CONTROL_CHANNEL_ID")
@@ -82,6 +117,10 @@ def build_bot() -> discord.Client:
     intents = discord.Intents.default()
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
+
+    # Port probe + heartbeat file location are computed once at boot.
+    probe = gc.make_port_probe(cfg.port_probe)
+    heartbeat = _heartbeat_path(cfg)
 
     def _channel_ok(interaction: discord.Interaction) -> bool:
         if allowed_channel is None:
@@ -177,6 +216,40 @@ def build_bot() -> discord.Client:
 
     tree.add_command(group, guild=guild_obj)
 
+    # --- background watchdog loop -----------------------------------------
+
+    @tasks.loop(seconds=_watchdog_interval())
+    async def watchdog():
+        try:
+            now = _now()
+            # Port probes can block on subprocess — push to a thread so the
+            # event loop keeps spinning.
+            actions = await asyncio.to_thread(
+                gc.watchdog_tick,
+                cfg.gateways,
+                probe,
+                now,
+            )
+            for action in actions:
+                gw = cfg.get(action.gateway_name)
+                if gw is None:
+                    continue
+                _watchdog_log(cfg, f"port probe failed for {gw.name}, restarting {gw.name} gateway")
+                res = await asyncio.to_thread(gc.restart, gw)
+                _watchdog_log(
+                    cfg,
+                    f"{gw.name} restart command issued (exit {res.returncode})",
+                )
+            # Heartbeat AFTER the work is done — a stuck tick won't refresh it.
+            await asyncio.to_thread(gc.write_heartbeat, heartbeat, now)
+        except Exception as e:  # don't let a bad tick kill the loop
+            log.exception("watchdog tick raised: %s", e)
+
+    @watchdog.before_loop
+    async def watchdog_ready():
+        await client.wait_until_ready()
+        log.info("watchdog loop starting (interval=%ss)", _watchdog_interval())
+
     @client.event
     async def on_ready():
         log.info("logged in as %s (id=%s)", client.user, client.user.id)
@@ -186,6 +259,8 @@ def build_bot() -> discord.Client:
         else:
             await tree.sync()
             log.info("slash commands synced globally (may take up to 1h)")
+        if not watchdog.is_running():
+            watchdog.start()
 
     return client
 

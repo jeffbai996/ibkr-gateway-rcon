@@ -1,0 +1,11 @@
+[Unit]
+Description=IBKR Gateway RCON Deadman Check (verifies bot heartbeat)
+# Only run when the bot service exists (it's the thing we might need to restart).
+After=ibkr-gateway-rcon-bot.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/repos/ibkr-gateway-rcon
+ExecStart=%h/repos/ibkr-gateway-rcon/venv/bin/python3 %h/repos/ibkr-gateway-rcon/deadman.py %h/repos/ibkr-gateway-rcon/config.yaml
+# Exit code 1 = "restart issued, that's expected and not a failure."
+SuccessExitStatus=0 1

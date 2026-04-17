@@ -400,3 +400,75 @@ def tail_log(log_path: Path, n: int = 20) -> list[str]:
         return []
     lines = log_path.read_text().splitlines()
     return lines[-n:]
+
+
+# ---------------------------------------------------------------------------
+# In-process watchdog
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WatchdogAction:
+    """An action the watchdog has decided to take on this tick."""
+
+    gateway_name: str
+    reason: str  # e.g. "port_down"
+
+
+def watchdog_tick(
+    gateways: list[GatewayConfig],
+    port_listening: Callable[[int], bool],
+    now: datetime,
+) -> list[WatchdogAction]:
+    """Pure function: given gateways + current port state + time, decide
+    which restarts to issue.
+
+    Side effect: garbage-collects expired skip-files (same as `is_skipped`).
+    """
+    actions: list[WatchdogAction] = []
+    for gw in gateways:
+        if is_skipped(gw.skip_file, now=now):
+            continue
+        if port_listening(gw.port):
+            continue
+        actions.append(WatchdogAction(gateway_name=gw.name, reason="port_down"))
+    return actions
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat (for deadman's switch)
+# ---------------------------------------------------------------------------
+
+
+def write_heartbeat(path: Path, now: datetime) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    path.write_text(now.astimezone(timezone.utc).isoformat())
+
+
+def read_heartbeat(path: Path) -> Optional[datetime]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    text = path.read_text().strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_heartbeat_stale(path: Path, max_age: timedelta, now: datetime) -> bool:
+    """True if no heartbeat, or heartbeat older than max_age."""
+    hb = read_heartbeat(path)
+    if hb is None:
+        return True
+    return (now - hb) > max_age

@@ -3,17 +3,37 @@
 Three front ends, one shared backend, filesystem as state.
 
 ```
-   Discord slash commands    Flask web page    Humans + cron
-           │                       │                │
-           └────┬──────────────────┴────────────────┘
+   Discord slash commands    Flask web page    Humans + CLI     systemd timer
+   (inside the bot)              │                 │                │
+     + watchdog loop              │                 │                │
+           │                      │                 │                │
+           └────┬─────────────────┴─────────────────┘                │
+                │                                                    │
+        gateway_ctl.py  +  gwctl.py  +  discord_bot.py  ←─── deadman.py
                 │
-        gateway_ctl.py  +  gwctl.py  (thin CLI over gateway_ctl)
-                │
-   ┌────────────┼────────────┐
-   │            │            │
-skip-files   port probe   watchdog log
- (YAML-free)  (ss/netstat)  (append-only text)
+   ┌────────────┼────────────┬──────────────┐
+   │            │            │              │
+skip-files   port probe   watchdog log   bot.heartbeat
+ (YAML-free)  (ss/netstat)  (append-only) (ISO timestamp)
 ```
+
+## The bot is the watchdog
+
+The Discord bot (`discord_bot.py`) runs its own `tasks.loop` every `WATCHDOG_INTERVAL_SEC` seconds (default 180). Each tick does the same thing the old cron watchdog did: probe every gateway port, check skip-files, fire restart commands for any gateway that's down and not paused. After a successful tick the bot writes a timestamp to `state/bot.heartbeat`.
+
+Benefits of owning the loop in-process:
+
+- **One process, one PID.** If the bot is up, the watchdog is up. No "cron keeps firing but the bot is dead" weirdness.
+- **Rich integration.** The bot can send a proactive message when a gateway has restarted N times in M minutes. That's harder from a standalone bash script.
+- **Easier testing.** `watchdog_tick` is a pure function — feed it a fake port probe and assert on the returned action list.
+
+## The deadman makes it safe
+
+The single-process design has a clear failure mode: if the bot dies, the watchdog dies with it. `deadman.py` closes that gap. It runs on a 5-minute systemd timer, independent of the bot. On each tick it reads `bot.heartbeat`; if the timestamp is older than 10 minutes (or the file is missing), it runs `systemctl --user restart ibkr-gateway-rcon-bot.service`.
+
+This is a small, dependency-light script that uses only `gateway_ctl`'s pure heartbeat helpers. If the bot's Python environment is wedged (OOM, import failure, event-loop deadlock), the deadman is unaffected — its entire execution is "read one text file, maybe run one shell command, exit."
+
+The bot service is configured with `Restart=always` in its systemd unit, so most bot crashes self-heal without needing the deadman at all. The deadman is for the harder class of failure: "bot process is alive but not doing work" (deadlock, exception-swallowed loop, Discord API stuck).
 
 ## Why filesystem as state?
 
