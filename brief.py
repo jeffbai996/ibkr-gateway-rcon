@@ -148,12 +148,11 @@ def _fx_to_cad(value: float, ccy: str, fx: dict[str, float]) -> float:
 
 
 def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
-    """Group positions by (symbol, currency) and convert everything to CAD.
+    """Group positions by (symbol, currency), summing across accounts.
 
-    Combining across currencies was a bug — e.g. GENERIC-USD at ~$407 and GENERIC-CAD
-    listings at ~$40 would produce a meaningless weighted avg. We keep the
-    (symbol, currency) pair as the key so each listing has its own row, then
-    convert display values to CAD so the brief stays single-currency.
+    Keeps CDR listings (CAD) as separate rows from their US parents — trying
+    to merge them is meaningless because they have different shares-per-unit.
+    Label with '(C)' for non-USD listings so Jeff can spot them.
     """
     by_key: dict[tuple[str, str], dict] = {}
     for p in positions.get("positions", []):
@@ -165,10 +164,9 @@ def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
                 "symbol": sym,
                 "currency": ccy,
                 "shares": 0.0,
-                "cost_total_native": 0.0,  # shares * avg_cost, native currency
+                "cost_total_native": 0.0,
                 "market_value_native": 0.0,
                 "unrealized_pnl_native": 0.0,
-                "accounts": set(),
             }
         row = by_key[key]
         shares = float(p.get("shares", 0))
@@ -177,90 +175,24 @@ def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
         row["cost_total_native"] += shares * avg_cost
         row["market_value_native"] += float(p.get("market_value", 0))
         row["unrealized_pnl_native"] += float(p.get("unrealized_pnl", 0))
-        row["accounts"].add(p.get("account", ""))
 
-    rows = []
+    out = []
     for (sym, ccy), r in by_key.items():
-        # avg_cost stays in native currency (per-share price in that listing's
-        # currency — mixing currencies for avg cost is nonsensical).
-        avg_cost = (r["cost_total_native"] / r["shares"]) if r["shares"] else 0.0
+        avg_native = (r["cost_total_native"] / r["shares"]) if r["shares"] else 0.0
         unreal_pct = (
             (r["unrealized_pnl_native"] / r["cost_total_native"] * 100)
             if r["cost_total_native"] else 0.0
         )
-        r["avg_cost_native"] = avg_cost
-        r["unrealized_pct"] = unreal_pct
-        # CAD-equivalent values for ranking / aggregation / display.
-        r["market_value_cad"] = _fx_to_cad(r["market_value_native"], ccy, fx)
-        r["unrealized_pnl_cad"] = _fx_to_cad(r["unrealized_pnl_native"], ccy, fx)
-        r["cost_total_cad"] = _fx_to_cad(r["cost_total_native"], ccy, fx)
-        rows.append(r)
-
-    # Merge (symbol × currency) back into one logical row per *symbol* for
-    # display — top-positions view should show "GENERIC" once, not twice.
-    # For unified rows: sum CAD-equivalent mv/pnl/cost; shares stays
-    # currency-specific so we render a separate note if the symbol spans.
-    merged: dict[str, dict] = {}
-    for r in rows:
-        sym = r["symbol"]
-        if sym not in merged:
-            merged[sym] = {
-                "symbol": sym,
-                "shares_by_ccy": {},  # {"USD": 5788, "CAD": 38888}
-                "market_value_cad": 0.0,
-                "unrealized_pnl_cad": 0.0,
-                "cost_total_cad": 0.0,
-                "primary_currency": r["currency"],  # track the dominant ccy
-                "primary_value_cad": 0.0,
-            }
-        m = merged[sym]
-        m["shares_by_ccy"][r["currency"]] = m["shares_by_ccy"].get(r["currency"], 0) + r["shares"]
-        m["market_value_cad"] += r["market_value_cad"]
-        m["unrealized_pnl_cad"] += r["unrealized_pnl_cad"]
-        m["cost_total_cad"] += r["cost_total_cad"]
-        # Dominant currency = the one with the bigger CAD-equivalent value.
-        if r["market_value_cad"] > m["primary_value_cad"]:
-            m["primary_value_cad"] = r["market_value_cad"]
-            m["primary_currency"] = r["currency"]
-
-    out = []
-    for sym, m in merged.items():
-        multi_ccy = len(m["shares_by_ccy"]) > 1
-        unreal_pct = (
-            (m["unrealized_pnl_cad"] / m["cost_total_cad"] * 100)
-            if m["cost_total_cad"] else 0.0
-        )
-
-        if multi_ccy:
-            # Different listings (e.g. GENERIC USD vs GENERIC CDR in CAD) have
-            # different shares-per-unit. Summing shares across currencies
-            # produces a meaningless number. Show the dominant listing's
-            # share count + flag, but the market value and P&L are real
-            # CAD sums across listings.
-            dom_shares = m["shares_by_ccy"].get(m["primary_currency"], 0.0)
-            dom_row = by_key.get((sym, m["primary_currency"]))
-            dom_avg_native = dom_row["avg_cost_native"] if dom_row else 0.0
-            display_shares = dom_shares
-            # Display avg in the dominant currency — accurate per-share price.
-            display_avg_cad = _fx_to_cad(dom_avg_native, m["primary_currency"], fx)
-        else:
-            dom_row = list(by_key.values())[0]  # safe because single-ccy
-            for (s, _), r in by_key.items():
-                if s == sym:
-                    dom_row = r
-                    break
-            display_shares = dom_row["shares"]
-            display_avg_cad = _fx_to_cad(dom_row["avg_cost_native"], dom_row["currency"], fx)
-
+        # Display label: 'GENERIC' for USD, 'GENERIC(C)' for CAD (CDR-style).
+        label = sym if ccy == "USD" else f"{sym}(C)"
         out.append({
+            "label": label,
             "symbol": sym,
-            "shares": display_shares,
-            "shares_by_ccy": m["shares_by_ccy"],
-            "multi_ccy": multi_ccy,
-            "primary_currency": m["primary_currency"],
-            "avg_cost_cad": display_avg_cad,
-            "market_value_cad": m["market_value_cad"],
-            "unrealized_pnl_cad": m["unrealized_pnl_cad"],
+            "currency": ccy,
+            "shares": r["shares"],
+            "avg_cost_cad": _fx_to_cad(avg_native, ccy, fx),
+            "market_value_cad": _fx_to_cad(r["market_value_native"], ccy, fx),
+            "unrealized_pnl_cad": _fx_to_cad(r["unrealized_pnl_native"], ccy, fx),
             "unrealized_pct": unreal_pct,
         })
 
@@ -363,35 +295,26 @@ def build_brief(data: BriefData, top_n: int = 5) -> str:
     if data.positions:
         rows = _combine_positions(data.positions, data.fx_rates)[:top_n]
         if rows:
-            # --- Holdings section: sym, shares, avg cost (CAD), market value (CAD) ---
+            # --- Holdings section ---
             lines.append("top positions (CAD)")
-            lines.append(f"  {'sym':<5} {'shares':>7} {'avg':>8} {'mv':>9}")
+            lines.append(f"  {'sym':<7} {'shares':>7} {'avg':>7} {'mv':>7}")
             for r in rows:
-                sym = r["symbol"][:5]
-                # If this symbol spans multiple currencies, flag it with *
-                flag = "*" if r.get("multi_ccy") else " "
+                label = r["label"][:7]
                 shares = f"{int(r['shares']):,}"
-                avg = f"${r['avg_cost_cad']:,.2f}"
+                avg = f"${r['avg_cost_cad']:,.0f}"
                 mv = _money_cad(r["market_value_cad"])
-                lines.append(f"  {sym}{flag}{' ' * max(0, 5-len(sym)-1)} {shares:>7} {avg:>8} {mv:>9}")
+                lines.append(f"  {label:<7} {shares:>7} {avg:>7} {mv:>7}")
             lines.append("")
 
             # --- Unrealized P&L section ---
             lines.append("unrealized p&l")
-            lines.append(f"  {'sym':<5} {'pnl':>10} {'%':>8}")
+            lines.append(f"  {'sym':<7} {'pnl':>8} {'%':>8}")
             for r in rows:
-                sym = r["symbol"][:5]
+                label = r["label"][:7]
                 pnl = _money_cad(r["unrealized_pnl_cad"])
                 pct = _pct(r["unrealized_pct"])
-                lines.append(f"  {sym:<5} {pnl:>10} {pct:>8}")
+                lines.append(f"  {label:<7} {pnl:>8} {pct:>8}")
             lines.append("")
-
-            # Multi-ccy footnote if any symbol was flagged
-            if any(r.get("multi_ccy") for r in rows):
-                lines.append("  * = also held in another listing;")
-                lines.append("      shares shown = dominant only,")
-                lines.append("      mv/pnl = CAD sum of both")
-                lines.append("")
 
     # Today's trades — compact
     trades_any = False
