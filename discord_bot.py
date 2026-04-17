@@ -66,25 +66,62 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _fmt_age_relative(dt: datetime, now: datetime) -> str:
+    """Human-friendly relative age: '3m ago', '2h ago', '1d ago'."""
+    delta = (now - dt).total_seconds()
+    if delta < 0:
+        return "in the future (clock skew?)"
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta / 60)}m ago"
+    if delta < 86400:
+        return f"{delta / 3600:.1f}h ago"
+    return f"{delta / 86400:.1f}d ago"
+
+
+def _fmt_until_relative(dt: datetime, now: datetime) -> str:
+    """'until X' phrasing for future deadlines: 'for 25m more', 'for 1.5h more'."""
+    delta = (dt - now).total_seconds()
+    if delta <= 0:
+        return "expiring now"
+    if delta < 60:
+        return f"for {int(delta)}s more"
+    if delta < 3600:
+        return f"for {int(delta / 60)}m more"
+    if delta < 86400:
+        return f"for {delta / 3600:.1f}h more"
+    return f"for {delta / 86400:.1f}d more"
+
+
 def _fmt_status(cfg: gc.Config) -> str:
-    """Mobile-friendly status: one gateway per block, stacked fields, <40 chars wide."""
+    """One block per gateway, stacked, <40 chars. Relative times for clarity."""
     probe = gc.make_port_probe(cfg.port_probe)
     now = _now()
     lines = ["```"]
     for i, gw in enumerate(cfg.gateways):
         st = gc.status_for(gw, port_listening=probe, log_path=cfg.log_file, now=now)
-        state = "UP" if st.up else "DOWN"
+        state = "running" if st.up else "stopped"
+
         if st.skipped:
-            paused = "indefinite" if st.skipped_until is None else st.skipped_until.strftime("%Y-%m-%d %H:%M UTC")
+            if st.skipped_until is None:
+                pause_line = "watchdog paused indefinitely"
+            else:
+                pause_line = f"watchdog paused {_fmt_until_relative(st.skipped_until, now)}"
         else:
-            paused = "—"
-        last = st.last_restart_at.strftime("%Y-%m-%d %H:%M") if st.last_restart_at else "—"
+            pause_line = "watchdog active"
+
+        if st.last_restart_at is None:
+            last_line = "no restarts on record"
+        else:
+            last_line = f"last restart {_fmt_age_relative(st.last_restart_at, now)}"
+
         if i > 0:
             lines.append("")
         lines.append(f"{gw.name} (port {gw.port})")
-        lines.append(f"  state   {state}")
-        lines.append(f"  paused  {paused}")
-        lines.append(f"  last    {last}")
+        lines.append(f"  state:   {state}")
+        lines.append(f"  {pause_line}")
+        lines.append(f"  {last_line}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -291,31 +328,38 @@ def build_bot() -> discord.Client:
 
         await interaction.response.defer(thinking=True)
 
-        # Auto-pause stopped gateways so the watchdog doesn't try to restart
-        # them on its next tick. The pause is indefinite — user must
-        # `/gateway resume` or `/gateway restart` to un-pause.
-        for gw in targets:
-            gc.pause(gw, until=None)
-
+        # Run stop commands FIRST, then decide whether to pause based on
+        # whether stop actually succeeded. Auto-pausing before the stop runs
+        # leaves phantom pauses in place when stop fails (e.g. telnet missing
+        # on Windows and Stop.bat errors out).
         results = await asyncio.gather(
             *[asyncio.to_thread(gc.stop, gw) for gw in targets],
             return_exceptions=False,
         )
 
         parts: list[str] = []
+        paused_gateways: list[str] = []
         for gw, res in zip(targets, results):
             if res is None:
-                parts.append(f"⚠️ `{gw.name}`: no stop_cmd")
+                parts.append(f"⚠️ `{gw.name}`: no stop_cmd configured")
                 continue
             if res.returncode == 0:
-                parts.append(f"✅ `{gw.name}`: stopped")
+                # Successful stop → auto-pause so watchdog doesn't revive it.
+                gc.pause(gw, until=None)
+                paused_gateways.append(gw.name)
+                parts.append(f"✅ `{gw.name}`: stopped, watchdog paused")
             else:
-                parts.append(f"⚠️ `{gw.name}`: stop exit {res.returncode}")
+                err = (res.stderr or res.stdout or "").strip()
+                parts.append(f"⚠️ `{gw.name}`: stop failed (exit {res.returncode}). gateway NOT paused.")
+                if err:
+                    parts.append(f"```{err[-400:]}```")
 
-        header = (
-            "stop issued for " + ", ".join(f"`{g.name}`" for g in targets) +
-            " (auto-paused — use /gateway restart or /gateway resume to bring back)"
-        )
+        header = "stop issued for " + ", ".join(f"`{g.name}`" for g in targets)
+        if paused_gateways:
+            header += (
+                f"\nauto-paused: {', '.join(paused_gateways)} — "
+                f"use /gateway restart to bring them back"
+            )
         summary = header + "\n" + "\n".join(parts)
         if len(summary) > 1900:
             summary = summary[:1900] + "…"
