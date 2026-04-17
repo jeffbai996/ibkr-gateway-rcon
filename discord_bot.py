@@ -280,6 +280,13 @@ def build_bot() -> discord.Client:
             tree.copy_global_to(guild=nonlocal_guild)
             await tree.sync(guild=nonlocal_guild)
             log.info("slash commands synced to guild %s", nonlocal_guild.id)
+
+            # Clear the global command list so users don't see duplicates
+            # (one guild-scoped entry + one global entry). Safe because every
+            # command we register is also copied into the guild above.
+            tree.clear_commands(guild=None)
+            await tree.sync()
+            log.info("cleared global command list (using guild-scoped only)")
         else:
             await tree.sync()
             log.info("slash commands synced globally (may take up to 1h)")
