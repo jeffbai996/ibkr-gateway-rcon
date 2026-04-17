@@ -82,8 +82,24 @@ def _fmt_status(cfg: gc.Config) -> str:
     return "\n".join(lines)
 
 
+ALL_SENTINEL = "__all__"
+
+
 def _choices(cfg: gc.Config) -> list[app_commands.Choice[str]]:
-    return [app_commands.Choice(name=g.name, value=g.name) for g in cfg.gateways]
+    """Build the per-command gateway picker, including an 'all' option that
+    applies the action to every configured gateway."""
+    per_gateway = [app_commands.Choice(name=g.name, value=g.name) for g in cfg.gateways]
+    return per_gateway + [app_commands.Choice(name="all (every gateway)", value=ALL_SENTINEL)]
+
+
+def _resolve_targets(cfg: gc.Config, choice_value: str) -> list[gc.GatewayConfig]:
+    """Translate a slash-command choice value into the list of gateways it
+    refers to. ALL_SENTINEL means every gateway; anything else is a single
+    gateway lookup."""
+    if choice_value == ALL_SENTINEL:
+        return list(cfg.gateways)
+    gw = cfg.get(choice_value)
+    return [gw] if gw else []
 
 
 def _watchdog_interval() -> int:
@@ -151,9 +167,9 @@ def build_bot() -> discord.Client:
             return await _reject_channel(interaction)
         await interaction.response.send_message(_fmt_status(cfg))
 
-    @group.command(name="pause", description="Suppress restarts for a gateway.")
+    @group.command(name="pause", description="Suppress restarts for a gateway (or all).")
     @app_commands.describe(
-        name="Which gateway to pause.",
+        name="Which gateway to pause, or 'all' for every gateway.",
         duration="How long — e.g. 30m, 2h, 1d. Leave blank for indefinite.",
     )
     @gateway_choice
@@ -164,46 +180,69 @@ def build_bot() -> discord.Client:
     ):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        gw = cfg.get(name.value)
-        if gw is None:
+        targets = _resolve_targets(cfg, name.value)
+        if not targets:
             return await interaction.response.send_message(f"Unknown gateway `{name.value}`.", ephemeral=True)
         try:
             until = gc.parse_duration(duration, now=_now())
         except gc.DurationError as e:
             return await interaction.response.send_message(f"Bad duration: {e}", ephemeral=True)
-        gc.pause(gw, until=until)
+        for gw in targets:
+            gc.pause(gw, until=until)
         label = "indefinitely" if until is None else f"until `{until.isoformat(timespec='minutes')}`"
-        await interaction.response.send_message(f"⏸️ `{gw.name}` paused {label}.")
+        names = ", ".join(f"`{g.name}`" for g in targets)
+        await interaction.response.send_message(f"⏸️ {names} paused {label}.")
 
-    @group.command(name="resume", description="Clear the pause on a gateway.")
-    @app_commands.describe(name="Which gateway to resume.")
+    @group.command(name="resume", description="Clear the pause on a gateway (or all).")
+    @app_commands.describe(name="Which gateway to resume, or 'all' for every gateway.")
     @gateway_choice
     async def resume(interaction: discord.Interaction, name: app_commands.Choice[str]):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        gw = cfg.get(name.value)
-        if gw is None:
+        targets = _resolve_targets(cfg, name.value)
+        if not targets:
             return await interaction.response.send_message(f"Unknown gateway `{name.value}`.", ephemeral=True)
-        gc.resume(gw)
-        await interaction.response.send_message(f"▶️ `{gw.name}` resumed.")
+        for gw in targets:
+            gc.resume(gw)
+        names = ", ".join(f"`{g.name}`" for g in targets)
+        await interaction.response.send_message(f"▶️ {names} resumed.")
 
-    @group.command(name="restart", description="Kick a gateway now, regardless of pause state.")
-    @app_commands.describe(name="Which gateway to restart.")
+    @group.command(name="restart", description="Kick a gateway now (or all), regardless of pause state.")
+    @app_commands.describe(name="Which gateway to restart, or 'all' for every gateway.")
     @gateway_choice
     async def restart(interaction: discord.Interaction, name: app_commands.Choice[str]):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        gw = cfg.get(name.value)
-        if gw is None:
+        targets = _resolve_targets(cfg, name.value)
+        if not targets:
             return await interaction.response.send_message(f"Unknown gateway `{name.value}`.", ephemeral=True)
         await interaction.response.defer(thinking=True)
-        res = await asyncio.to_thread(gc.restart, gw)
-        summary = f"✅ restart command issued for `{gw.name}` (exit {res.returncode})."
-        if res.returncode != 0:
-            summary = f"⚠️ restart for `{gw.name}` exited {res.returncode}."
-        tail = (res.stdout or res.stderr or "").strip()
-        if tail:
-            summary += f"\n```{tail[-1500:]}```"
+
+        # Run all restarts in parallel — 240s timeout per, but two gateways
+        # serially would block the UI for 8 minutes worst-case. Parallel keeps it
+        # bounded to the single longest restart.
+        results = await asyncio.gather(
+            *[asyncio.to_thread(gc.restart, gw) for gw in targets],
+            return_exceptions=False,
+        )
+
+        parts: list[str] = []
+        overall_ok = True
+        for gw, res in zip(targets, results):
+            if res.returncode == 0:
+                parts.append(f"✅ `{gw.name}`: exit 0")
+            else:
+                overall_ok = False
+                parts.append(f"⚠️ `{gw.name}`: exit {res.returncode}")
+                tail = (res.stderr or res.stdout or "").strip()
+                if tail:
+                    parts.append(f"```{tail[-500:]}```")
+
+        header = "restart issued for " + ", ".join(f"`{g.name}`" for g in targets)
+        summary = header + "\n" + "\n".join(parts)
+        # Discord's 2000-char cap.
+        if len(summary) > 1900:
+            summary = summary[:1900] + "…"
         await interaction.followup.send(summary)
 
     @group.command(name="tail", description="Show the tail of the watchdog log.")
