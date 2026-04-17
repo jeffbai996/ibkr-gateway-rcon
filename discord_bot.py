@@ -237,21 +237,25 @@ def build_bot() -> discord.Client:
             return await interaction.response.send_message("No gateways configured.", ephemeral=True)
         await interaction.response.defer(thinking=True)
 
-        # Run all restarts in parallel — 240s timeout per, but two gateways
-        # serially would block the UI for 8 minutes worst-case. Parallel keeps it
-        # bounded to the single longest restart.
+        # Clear any skip-files first — a restart is an explicit "bring this
+        # back up" action, it shouldn't get swatted by a lingering pause.
+        for gw in targets:
+            gc.resume(gw)
+
+        # smart_restart: if the gateway is already running, runs restart_cmd.
+        # If the port is down, runs start_cmd (or restart_cmd as fallback).
+        # That way "restart" is always the user's mental model regardless of
+        # current state.
         results = await asyncio.gather(
-            *[asyncio.to_thread(gc.restart, gw) for gw in targets],
+            *[asyncio.to_thread(gc.smart_restart, gw, probe) for gw in targets],
             return_exceptions=False,
         )
 
         parts: list[str] = []
-        overall_ok = True
         for gw, res in zip(targets, results):
             if res.returncode == 0:
                 parts.append(f"✅ `{gw.name}`: exit 0")
             else:
-                overall_ok = False
                 parts.append(f"⚠️ `{gw.name}`: exit {res.returncode}")
                 tail = (res.stderr or res.stdout or "").strip()
                 if tail:
@@ -259,7 +263,60 @@ def build_bot() -> discord.Client:
 
         header = "restart issued for " + ", ".join(f"`{g.name}`" for g in targets)
         summary = header + "\n" + "\n".join(parts)
-        # Discord's 2000-char cap.
+        if len(summary) > 1900:
+            summary = summary[:1900] + "…"
+        await interaction.followup.send(summary)
+
+    @group.command(name="stop", description="Stop gateway now.")
+    @app_commands.describe(name="Gateway to stop. Omit to stop every gateway.")
+    @gateway_choice
+    async def stop(
+        interaction: discord.Interaction,
+        name: Optional[app_commands.Choice[str]] = None,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        targets = _targets_from_choice(name)
+        if not targets:
+            return await interaction.response.send_message("No gateways configured.", ephemeral=True)
+
+        # Refuse if any target lacks a stop_cmd — no-op without it.
+        missing = [g.name for g in targets if not g.stop_cmd]
+        if missing:
+            return await interaction.response.send_message(
+                f"⚠️ no stop_cmd configured for: {', '.join(missing)}. "
+                f"edit config.yaml and restart the bot.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(thinking=True)
+
+        # Auto-pause stopped gateways so the watchdog doesn't try to restart
+        # them on its next tick. The pause is indefinite — user must
+        # `/gateway resume` or `/gateway restart` to un-pause.
+        for gw in targets:
+            gc.pause(gw, until=None)
+
+        results = await asyncio.gather(
+            *[asyncio.to_thread(gc.stop, gw) for gw in targets],
+            return_exceptions=False,
+        )
+
+        parts: list[str] = []
+        for gw, res in zip(targets, results):
+            if res is None:
+                parts.append(f"⚠️ `{gw.name}`: no stop_cmd")
+                continue
+            if res.returncode == 0:
+                parts.append(f"✅ `{gw.name}`: stopped")
+            else:
+                parts.append(f"⚠️ `{gw.name}`: stop exit {res.returncode}")
+
+        header = (
+            "stop issued for " + ", ".join(f"`{g.name}`" for g in targets) +
+            " (auto-paused — use /gateway restart or /gateway resume to bring back)"
+        )
+        summary = header + "\n" + "\n".join(parts)
         if len(summary) > 1900:
             summary = summary[:1900] + "…"
         await interaction.followup.send(summary)
