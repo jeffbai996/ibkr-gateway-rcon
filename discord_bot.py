@@ -67,18 +67,24 @@ def _now() -> datetime:
 
 
 def _fmt_status(cfg: gc.Config) -> str:
+    """Mobile-friendly status: one gateway per block, stacked fields, <40 chars wide."""
     probe = gc.make_port_probe(cfg.port_probe)
     now = _now()
-    lines = ["```", f"{'name':<12} {'port':<6} {'state':<6} {'paused until':<22} last restart"]
-    for gw in cfg.gateways:
+    lines = ["```"]
+    for i, gw in enumerate(cfg.gateways):
         st = gc.status_for(gw, port_listening=probe, log_path=cfg.log_file, now=now)
         state = "UP" if st.up else "DOWN"
         if st.skipped:
-            paused = "indefinite" if st.skipped_until is None else st.skipped_until.isoformat(timespec="minutes")
+            paused = "indefinite" if st.skipped_until is None else st.skipped_until.strftime("%Y-%m-%d %H:%M UTC")
         else:
             paused = "—"
-        last = st.last_restart_at.isoformat(timespec="seconds") if st.last_restart_at else "—"
-        lines.append(f"{gw.name:<12} {gw.port:<6} {state:<6} {paused:<22} {last}")
+        last = st.last_restart_at.strftime("%Y-%m-%d %H:%M") if st.last_restart_at else "—"
+        if i > 0:
+            lines.append("")
+        lines.append(f"{gw.name} (port {gw.port})")
+        lines.append(f"  state   {state}")
+        lines.append(f"  paused  {paused}")
+        lines.append(f"  last    {last}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -168,22 +174,28 @@ def build_bot() -> discord.Client:
             return await _reject_channel(interaction)
         await interaction.response.send_message(_fmt_status(cfg))
 
-    @group.command(name="pause", description="Suppress restarts for a gateway (or all).")
+    def _targets_from_choice(choice: Optional[app_commands.Choice[str]]) -> list[gc.GatewayConfig]:
+        """If no choice was made, default to every gateway."""
+        if choice is None:
+            return list(cfg.gateways)
+        return _resolve_targets(cfg, choice.value)
+
+    @group.command(name="pause", description="Suppress restarts for a gateway (defaults to all).")
     @app_commands.describe(
-        name="Which gateway to pause, or 'all' for every gateway.",
+        name="Gateway to pause. Omit to pause every gateway.",
         duration="How long — e.g. 30m, 2h, 1d. Leave blank for indefinite.",
     )
     @gateway_choice
     async def pause(
         interaction: discord.Interaction,
-        name: app_commands.Choice[str],
+        name: Optional[app_commands.Choice[str]] = None,
         duration: Optional[str] = None,
     ):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        targets = _resolve_targets(cfg, name.value)
+        targets = _targets_from_choice(name)
         if not targets:
-            return await interaction.response.send_message(f"Unknown gateway `{name.value}`.", ephemeral=True)
+            return await interaction.response.send_message("No gateways configured.", ephemeral=True)
         try:
             until = gc.parse_duration(duration, now=_now())
         except gc.DurationError as e:
@@ -194,29 +206,35 @@ def build_bot() -> discord.Client:
         names = ", ".join(f"`{g.name}`" for g in targets)
         await interaction.response.send_message(f"⏸️ {names} paused {label}.")
 
-    @group.command(name="resume", description="Clear the pause on a gateway (or all).")
-    @app_commands.describe(name="Which gateway to resume, or 'all' for every gateway.")
+    @group.command(name="resume", description="Clear the pause on a gateway (defaults to all).")
+    @app_commands.describe(name="Gateway to resume. Omit to resume every gateway.")
     @gateway_choice
-    async def resume(interaction: discord.Interaction, name: app_commands.Choice[str]):
+    async def resume(
+        interaction: discord.Interaction,
+        name: Optional[app_commands.Choice[str]] = None,
+    ):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        targets = _resolve_targets(cfg, name.value)
+        targets = _targets_from_choice(name)
         if not targets:
-            return await interaction.response.send_message(f"Unknown gateway `{name.value}`.", ephemeral=True)
+            return await interaction.response.send_message("No gateways configured.", ephemeral=True)
         for gw in targets:
             gc.resume(gw)
         names = ", ".join(f"`{g.name}`" for g in targets)
         await interaction.response.send_message(f"▶️ {names} resumed.")
 
-    @group.command(name="restart", description="Kick a gateway now (or all), regardless of pause state.")
-    @app_commands.describe(name="Which gateway to restart, or 'all' for every gateway.")
+    @group.command(name="restart", description="Restart gateway now, regardless of pause state.")
+    @app_commands.describe(name="Gateway to restart. Omit to restart every gateway.")
     @gateway_choice
-    async def restart(interaction: discord.Interaction, name: app_commands.Choice[str]):
+    async def restart(
+        interaction: discord.Interaction,
+        name: Optional[app_commands.Choice[str]] = None,
+    ):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        targets = _resolve_targets(cfg, name.value)
+        targets = _targets_from_choice(name)
         if not targets:
-            return await interaction.response.send_message(f"Unknown gateway `{name.value}`.", ephemeral=True)
+            return await interaction.response.send_message("No gateways configured.", ephemeral=True)
         await interaction.response.defer(thinking=True)
 
         # Run all restarts in parallel — 240s timeout per, but two gateways

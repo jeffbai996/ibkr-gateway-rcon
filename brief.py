@@ -189,58 +189,74 @@ def _today_trades_brief(trades_md: str, max_lines: int = 6) -> list[str]:
 
 
 def build_brief(data: BriefData, top_n: int = 5) -> str:
-    """Render BriefData as a mobile-friendly Discord message."""
+    """Mobile-friendly brief wrapped in a code block. Lines ≤ ~36 chars."""
     if not data.healthy:
-        return "⚠️ **brief unavailable** — ibkr mcp not responding."
+        return "⚠️ brief unavailable — ibkr mcp not responding."
 
-    lines: list[str] = []
+    lines: list[str] = ["```"]
 
     if data.summary:
         combined_nlv = data.summary.get("combined_nlv")
         ccy = data.summary.get("currency", "CAD")
         if combined_nlv is not None:
-            lines.append(f"**Combined NLV:** {_money(combined_nlv, ccy)}")
+            lines.append(f"NLV  {_money(combined_nlv, ccy)}")
+            lines.append("")
 
         for acct in data.summary.get("accounts", []):
             acct_id = acct["account"]
             nlv = acct.get("nlv", 0)
             cushion = acct.get("cushion_pct", 0)
             lev = acct.get("leverage", 0)
-            cushion_flag = "🟢" if cushion >= 10 else "🟡" if cushion >= 5 else "🔴"
             pnl_tuple = _extract_daily_pnl(data.pnl_by_account.get(acct_id, ""))
-            pnl_str = ""
+
+            lines.append(f"{acct_id}")
+            lines.append(f"  nlv     {_money(nlv, ccy)}")
             if pnl_tuple:
                 dollars, pct = pnl_tuple
-                pnl_str = f" · {_emoji_pnl(dollars)} {_money(dollars, ccy)} ({_pct(pct)})"
-            lines.append(
-                f"  **{acct_id}:** {_money(nlv, ccy)}{pnl_str} · cushion {cushion:.1f}% {cushion_flag} · lev {lev:.2f}x"
-            )
+                lines.append(f"  day     {_money(dollars, ccy)} ({_pct(pct)})")
+            cushion_tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
+            lines.append(f"  cushion {cushion:.1f}% ({cushion_tag})")
+            lines.append(f"  lev     {lev:.2f}x")
+            lines.append("")
 
     if data.positions:
         rows = _combine_positions(data.positions)[:top_n]
         if rows:
-            lines.append("")
-            lines.append("**Top positions (combined):**")
+            lines.append("top positions (combined)")
+            # Column widths: symbol (5), shares (7), value (9), pnl (9)
             for r in rows:
-                pnl_emoji = _emoji_pnl(r["unrealized_pnl"])
-                lines.append(
-                    f"  {r['symbol']:<5} {int(r['shares']):>6,} @ {_money(r['market_value'], r['currency'])} · {pnl_emoji} {_money(r['unrealized_pnl'], r['currency'])}"
-                )
+                sym = r["symbol"][:5]
+                shares = f"{int(r['shares']):,}"
+                val = _money(r["market_value"], r["currency"])
+                pnl = _money(r["unrealized_pnl"], r["currency"])
+                lines.append(f"  {sym:<5} {shares:>7} {val:>9} {pnl:>9}")
+            lines.append("")
 
-    # Today's trades, if any
-    trades_lines: list[str] = []
+    # Today's trades — compact
+    trades_any = False
     for acct, md in data.trades_by_account.items():
-        tlines = _today_trades_brief(md)
+        tlines = _today_trades_brief(md, max_lines=5)
         if tlines:
-            trades_lines.append(f"  *{acct}:*")
-            trades_lines.extend(f"  {t}" for t in tlines)
-    if trades_lines:
+            if not trades_any:
+                lines.append("today's trades")
+                trades_any = True
+            lines.append(f"  {acct}")
+            # md lines are pipe-delimited tables; trim to the meaningful cols.
+            for t in tlines:
+                cells = [c.strip() for c in t.strip("|").split("|")]
+                # Expected columns vary; take first 3 non-empty.
+                compact = " ".join(c for c in cells if c)[:34]
+                lines.append(f"    {compact}")
+    if trades_any:
         lines.append("")
-        lines.append("**Today's trades:**")
-        lines.extend(trades_lines)
+
+    # Trim trailing blank lines
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    lines.append("```")
 
     if data.fetch_errors:
-        lines.append("")
         lines.append(f"⚠️ partial: {', '.join(data.fetch_errors)}")
 
     return "\n".join(lines)
@@ -318,34 +334,40 @@ def _fmt_age(seconds: float) -> str:
 
 
 def build_health(data: HealthData, now: datetime) -> str:
-    lines: list[str] = ["**Gateway health**"]
+    """Mobile-friendly health wrapped in a code block."""
+    lines: list[str] = ["```"]
 
     # Heartbeat
     if data.heartbeat_age_s is None:
-        lines.append("  Watchdog heartbeat: ⚠️ missing")
+        lines.append("heartbeat  MISSING")
     else:
         max_healthy = data.watchdog_interval_s * 2
-        emoji = "🟢" if data.heartbeat_age_s < max_healthy else "🔴"
-        lines.append(
-            f"  Watchdog heartbeat: {emoji} {_fmt_age(data.heartbeat_age_s)} ago (tick every {data.watchdog_interval_s}s)"
-        )
-
+        tag = "ok" if data.heartbeat_age_s < max_healthy else "STALE"
+        lines.append(f"heartbeat  {_fmt_age(data.heartbeat_age_s)} ago ({tag})")
+    lines.append(f"interval   {data.watchdog_interval_s}s")
     lines.append("")
-    for st in data.gateways:
-        state_emoji = "🟢" if st.up else "🔴"
-        paused = ""
+
+    for i, st in enumerate(data.gateways):
+        if i > 0:
+            lines.append("")
+        state = "UP" if st.up else "DOWN"
+        lines.append(f"{st.name} (port {st.port})")
+        lines.append(f"  state     {state}")
         if st.skipped:
             if st.skipped_until is None:
-                paused = " · ⏸️ paused (indefinite)"
+                lines.append(f"  paused    indefinite")
             else:
                 delta = (st.skipped_until - now).total_seconds()
-                paused = f" · ⏸️ paused ({_fmt_age(max(delta, 0))} left)"
+                lines.append(f"  paused    {_fmt_age(max(delta, 0))} left")
+        else:
+            lines.append(f"  paused    no")
         restarts = data.restarts_last_24h.get(st.name, 0)
         last = data.last_restart_per_gateway.get(st.name)
         last_str = "never" if last is None else f"{_fmt_age((now - last).total_seconds())} ago"
-        lines.append(f"  **{st.name}** ({st.port}) {state_emoji}{paused}")
-        lines.append(f"    restarts/24h: {restarts} · last: {last_str}")
+        lines.append(f"  24h rest  {restarts}")
+        lines.append(f"  last      {last_str}")
 
+    lines.append("```")
     return "\n".join(lines)
 
 
