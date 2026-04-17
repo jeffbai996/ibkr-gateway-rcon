@@ -108,9 +108,16 @@ def _watchdog_log(cfg: gc.Config, message: str) -> None:
     _log_append(cfg.log_file, f"{ts} — {message}")
 
 
+def _parse_channel_ids(raw: str | None) -> set[str]:
+    """DISCORD_CONTROL_CHANNEL_ID accepts a single ID or a comma-separated list."""
+    if not raw:
+        return set()
+    return {tok.strip() for tok in raw.split(",") if tok.strip()}
+
+
 def build_bot() -> discord.Client:
     cfg = _load_cfg()
-    allowed_channel = os.environ.get("DISCORD_CONTROL_CHANNEL_ID")
+    allowed_channels = _parse_channel_ids(os.environ.get("DISCORD_CONTROL_CHANNEL_ID"))
     guild_id_raw = os.environ.get("DISCORD_GUILD_ID")
     guild_obj = discord.Object(id=int(guild_id_raw)) if guild_id_raw else None
 
@@ -123,13 +130,13 @@ def build_bot() -> discord.Client:
     heartbeat = _heartbeat_path(cfg)
 
     def _channel_ok(interaction: discord.Interaction) -> bool:
-        if allowed_channel is None:
+        if not allowed_channels:
             return True
-        return str(interaction.channel_id) == allowed_channel
+        return str(interaction.channel_id) in allowed_channels
 
     def _reject_channel(interaction: discord.Interaction):
         return interaction.response.send_message(
-            "Gateway controls are restricted to the configured channel.",
+            "Gateway controls are restricted to the configured channel(s).",
             ephemeral=True,
         )
 
@@ -214,7 +221,8 @@ def build_bot() -> discord.Client:
             text = text[-1900:]
         await interaction.response.send_message(f"```\n{text}\n```")
 
-    tree.add_command(group, guild=guild_obj)
+    # Register globally; on_ready will copy to the guild for instant availability.
+    tree.add_command(group)
 
     # --- background watchdog loop -----------------------------------------
 
@@ -253,12 +261,29 @@ def build_bot() -> discord.Client:
     @client.event
     async def on_ready():
         log.info("logged in as %s (id=%s)", client.user, client.user.id)
-        if guild_obj is not None:
-            await tree.sync(guild=guild_obj)
-            log.info("slash commands synced to guild %s", guild_obj.id)
+
+        # If guild wasn't provided via env, auto-discover from one of the allowed
+        # control channels. Guild-scoped sync is instant; global sync takes ~1h
+        # on first push, so discovery is the faster path.
+        nonlocal_guild = guild_obj
+        if nonlocal_guild is None and allowed_channels:
+            for cid in allowed_channels:
+                ch = client.get_channel(int(cid))
+                if ch is not None and getattr(ch, "guild", None) is not None:
+                    nonlocal_guild = discord.Object(id=ch.guild.id)
+                    log.info("auto-discovered guild id %s from channel %s", ch.guild.id, cid)
+                    break
+
+        if nonlocal_guild is not None:
+            # Copy the global command tree into this guild for instant availability,
+            # then sync. Without this, global commands take ~1h to propagate.
+            tree.copy_global_to(guild=nonlocal_guild)
+            await tree.sync(guild=nonlocal_guild)
+            log.info("slash commands synced to guild %s", nonlocal_guild.id)
         else:
             await tree.sync()
             log.info("slash commands synced globally (may take up to 1h)")
+
         if not watchdog.is_running():
             watchdog.start()
 
