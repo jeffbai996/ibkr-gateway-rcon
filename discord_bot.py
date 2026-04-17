@@ -168,7 +168,7 @@ def build_bot() -> discord.Client:
     # Build choices fresh from config so deploys pick up new gateways.
     gateway_choice = app_commands.choices(name=_choices(cfg))
 
-    @group.command(name="status", description="Show state of every gateway.")
+    @group.command(name="status", description="Show state of every gateway")
     async def status(interaction: discord.Interaction):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
@@ -180,7 +180,7 @@ def build_bot() -> discord.Client:
             return list(cfg.gateways)
         return _resolve_targets(cfg, choice.value)
 
-    @group.command(name="pause", description="Suppress restarts for a gateway (defaults to all).")
+    @group.command(name="pause", description="Suppress restarts for a gateway (defaults to all)")
     @app_commands.describe(
         name="Gateway to pause. Omit to pause every gateway.",
         duration="How long — e.g. 30m, 2h, 1d. Leave blank for indefinite.",
@@ -206,7 +206,7 @@ def build_bot() -> discord.Client:
         names = ", ".join(f"`{g.name}`" for g in targets)
         await interaction.response.send_message(f"⏸️ {names} paused {label}.")
 
-    @group.command(name="resume", description="Clear the pause on a gateway (defaults to all).")
+    @group.command(name="resume", description="Clear the pause on a gateway (defaults to all)")
     @app_commands.describe(name="Gateway to resume. Omit to resume every gateway.")
     @gateway_choice
     async def resume(
@@ -223,7 +223,7 @@ def build_bot() -> discord.Client:
         names = ", ".join(f"`{g.name}`" for g in targets)
         await interaction.response.send_message(f"▶️ {names} resumed.")
 
-    @group.command(name="restart", description="Restart gateway now, regardless of pause state.")
+    @group.command(name="restart", description="Restart gateway now, regardless of pause state")
     @app_commands.describe(name="Gateway to restart. Omit to restart every gateway.")
     @gateway_choice
     async def restart(
@@ -267,7 +267,7 @@ def build_bot() -> discord.Client:
             summary = summary[:1900] + "…"
         await interaction.followup.send(summary)
 
-    @group.command(name="stop", description="Stop gateway now.")
+    @group.command(name="stop", description="Stop gateway now")
     @app_commands.describe(name="Gateway to stop. Omit to stop every gateway.")
     @gateway_choice
     async def stop(
@@ -321,7 +321,7 @@ def build_bot() -> discord.Client:
             summary = summary[:1900] + "…"
         await interaction.followup.send(summary)
 
-    @group.command(name="tail", description="Show the tail of the watchdog log.")
+    @group.command(name="tail", description="Show the tail of the watchdog log")
     @app_commands.describe(n="Number of lines (default 20, max 100).")
     async def tail(interaction: discord.Interaction, n: Optional[int] = 20):
         if not _channel_ok(interaction):
@@ -336,7 +336,7 @@ def build_bot() -> discord.Client:
             text = text[-1900:]
         await interaction.response.send_message(f"```\n{text}\n```")
 
-    @group.command(name="health", description="Gateway process health — uptime, restarts, heartbeat.")
+    @group.command(name="health", description="Gateway process health — uptime, restarts, heartbeat")
     async def health(interaction: discord.Interaction):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
@@ -351,7 +351,7 @@ def build_bot() -> discord.Client:
         )
         await interaction.response.send_message(bf.build_health(data, now))
 
-    @group.command(name="brief", description="Portfolio brief: NLV, P&L, top positions, today's trades.")
+    @group.command(name="brief", description="Portfolio brief: NLV, P&L, top positions, today's trades")
     async def brief_cmd(interaction: discord.Interaction):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
