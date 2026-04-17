@@ -42,6 +42,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import gateway_ctl as gc
+import brief as bf
 
 
 log = logging.getLogger("gateway_bot")
@@ -259,6 +260,33 @@ def build_bot() -> discord.Client:
         if len(text) > 1900:
             text = text[-1900:]
         await interaction.response.send_message(f"```\n{text}\n```")
+
+    @group.command(name="health", description="Gateway process health — uptime, restarts, heartbeat.")
+    async def health(interaction: discord.Interaction):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        now = _now()
+        data = await asyncio.to_thread(
+            bf.fetch_health_data,
+            cfg,
+            probe,
+            heartbeat,
+            _watchdog_interval(),
+            now,
+        )
+        await interaction.response.send_message(bf.build_health(data, now))
+
+    @group.command(name="brief", description="Portfolio brief: NLV, P&L, top positions, today's trades.")
+    async def brief_cmd(interaction: discord.Interaction):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        data = await bf.fetch_brief_data(bf.mcp_url_from_env())
+        out = bf.build_brief(data)
+        # Discord 2000-char cap.
+        if len(out) > 1950:
+            out = out[:1950] + "…"
+        await interaction.followup.send(out)
 
     # Register globally; on_ready will copy to the guild for instant availability.
     tree.add_command(group)
