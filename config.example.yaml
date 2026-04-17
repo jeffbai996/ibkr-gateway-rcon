@@ -1,0 +1,24 @@
+# Copy to config.yaml and fill in your real values.
+# config.yaml is gitignored. DO NOT commit real infra details.
+
+state_dir: state              # where skip-files live, relative to repo root
+log_file: watchdog.log        # shared log all components read
+
+# Each gateway entry describes one instance under management.
+# `port` is the TCP port the gateway listens on locally.
+# `restart_cmd` is a shell command that (re)starts the gateway. Runs via /bin/sh -c.
+# `skip_file` is a filename inside state_dir. Keep unique per gateway.
+gateways:
+  - name: primary
+    port: 4001
+    restart_cmd: "echo 'replace with your restart command, e.g. cmd.exe /c RestartGateway_primary.bat'"
+    skip_file: primary.skip
+  - name: secondary
+    port: 4002
+    restart_cmd: "echo 'replace with your restart command'"
+    skip_file: secondary.skip
+
+# How the watchdog detects whether a port is listening.
+# "netstat" works on Linux, "wsl-cmd-netstat" uses Windows netstat via cmd.exe
+# (appropriate when gateways run on Windows and the watchdog runs under WSL).
+port_probe: netstat   # one of: netstat | wsl-cmd-netstat | ss
