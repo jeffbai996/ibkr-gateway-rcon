@@ -387,12 +387,25 @@ def resume(gw: GatewayConfig) -> None:
     clear_skip(gw.skip_file)
 
 
-def restart(gw: GatewayConfig) -> subprocess.CompletedProcess:
+def restart(gw: GatewayConfig, timeout: int = 240) -> subprocess.CompletedProcess:
     """Fire the configured restart command. Returns CompletedProcess for callers
-    that want exit code / stdout. Does NOT raise on non-zero exit."""
-    return subprocess.run(
-        gw.restart_cmd, shell=True, capture_output=True, text=True, timeout=60
-    )
+    that want exit code / stdout. Does NOT raise on non-zero exit.
+
+    Default 240s timeout — IBKR gateway cold restarts can take ~2-3 minutes
+    because of IBKey auth + gateway JVM warmup. A tighter timeout would
+    interrupt legitimate restarts.
+    """
+    try:
+        return subprocess.run(
+            gw.restart_cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            args=gw.restart_cmd,
+            returncode=-1,
+            stdout=(e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")),
+            stderr=f"restart timed out after {timeout}s",
+        )
 
 
 def tail_log(log_path: Path, n: int = 20) -> list[str]:
