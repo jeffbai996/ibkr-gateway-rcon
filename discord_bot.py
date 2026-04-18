@@ -407,6 +407,91 @@ def build_bot() -> discord.Client:
             out = out[:1950] + "…"
         await interaction.followup.send(out)
 
+    @group.command(name="pnl", description="Per-account P&L breakdown — daily, unrealized, realized")
+    @app_commands.describe(account="Account ID (e.g. U18542138). Omit for all.")
+    async def pnl_cmd(
+        interaction: discord.Interaction,
+        account: Optional[str] = None,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        view = await bf.fetch_account_view(
+            bf.mcp_url_from_env(),
+            want_positions=False,
+            want_pnl=True,
+            want_trades=False,
+        )
+        out = bf.build_pnl(view, account=account)
+        if len(out) > 1950:
+            out = out[:1950] + "…"
+        await interaction.followup.send(out)
+
+    @group.command(name="positions", description="Top positions with cost basis, mv, unrealized P&L")
+    @app_commands.describe(
+        account="Account ID to filter. Omit for combined.",
+        top="How many rows (default 10, max 25).",
+    )
+    async def positions_cmd(
+        interaction: discord.Interaction,
+        account: Optional[str] = None,
+        top: Optional[int] = None,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        n = max(1, min(int(top or 10), 25))
+        view = await bf.fetch_account_view(
+            bf.mcp_url_from_env(),
+            want_positions=True,
+            want_pnl=False,
+            want_trades=False,
+        )
+        out = bf.build_positions(view, account=account, top_n=n)
+        if len(out) > 1950:
+            out = out[:1950] + "…"
+        await interaction.followup.send(out)
+
+    @group.command(name="trades", description="Today's executions by account")
+    @app_commands.describe(account="Account ID to filter. Omit for all.")
+    async def trades_cmd(
+        interaction: discord.Interaction,
+        account: Optional[str] = None,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        view = await bf.fetch_account_view(
+            bf.mcp_url_from_env(),
+            want_positions=False,
+            want_pnl=False,
+            want_trades=True,
+        )
+        out = bf.build_trades(view, account=account)
+        if len(out) > 1950:
+            out = out[:1950] + "…"
+        await interaction.followup.send(out)
+
+    @group.command(name="margin", description="Margin close-up: cushion, excess liq, bp, leverage, util")
+    @app_commands.describe(account="Account ID to filter. Omit for all.")
+    async def margin_cmd(
+        interaction: discord.Interaction,
+        account: Optional[str] = None,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        view = await bf.fetch_account_view(
+            bf.mcp_url_from_env(),
+            want_positions=False,
+            want_pnl=False,
+            want_trades=False,
+        )
+        out = bf.build_margin(view, account=account)
+        if len(out) > 1950:
+            out = out[:1950] + "…"
+        await interaction.followup.send(out)
+
     # Register globally; on_ready will copy to the guild for instant availability.
     tree.add_command(group)
 
