@@ -384,7 +384,14 @@ def build_bot() -> discord.Client:
     async def health(interaction: discord.Interaction):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
         now = _now()
+        # MCP probe is best-effort — if it fails we still render the
+        # gateway-process section, just without the mcp: line.
+        try:
+            mcp_per_gw, acct_errs = await bf.fetch_mcp_status(bf.mcp_url_from_env())
+        except Exception:
+            mcp_per_gw, acct_errs = {}, []
         data = await asyncio.to_thread(
             bf.fetch_health_data,
             cfg,
@@ -392,8 +399,10 @@ def build_bot() -> discord.Client:
             heartbeat,
             _watchdog_interval(),
             now,
+            mcp_per_gw,
+            acct_errs,
         )
-        await interaction.response.send_message(bf.build_health(data, now))
+        await interaction.followup.send(bf.build_health(data, now))
 
     @group.command(name="brief", description="Portfolio brief: NLV, P&L, top positions, today's trades")
     async def brief_cmd(interaction: discord.Interaction):
