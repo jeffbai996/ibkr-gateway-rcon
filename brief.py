@@ -370,6 +370,416 @@ def build_brief(data: BriefData, top_n: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-account deep views — pnl, positions, trades, margin
+# ---------------------------------------------------------------------------
+
+
+def _parse_pnl_markdown(md: str) -> dict[str, Optional[float]]:
+    """Extract daily/unrealized/realized dollar amounts + daily % from the
+    markdown body the MCP returns. Missing fields come back as None."""
+    out: dict[str, Optional[float]] = {
+        "daily": None,
+        "daily_pct": None,
+        "unrealized": None,
+        "realized": None,
+    }
+    if not md:
+        return out
+
+    def _dollars(line: str) -> Optional[float]:
+        if "$" not in line:
+            return None
+        try:
+            after = line.split("$", 1)[1]
+            token = after.split()[0].replace(",", "")
+            val = float(token.lstrip("+"))
+            # sign lives just before the $ (e.g. "-$1,234" or "+$1,234")
+            before = line.split("$", 1)[0]
+            if before.rstrip().endswith("-"):
+                val = -val
+            return val
+        except (IndexError, ValueError):
+            return None
+
+    for raw in md.splitlines():
+        line = raw.strip()
+        if "Daily P&L" in line:
+            out["daily"] = _dollars(line)
+            if "(" in line and "%" in line:
+                try:
+                    pct_token = line.split("(", 1)[1].split("%", 1)[0]
+                    out["daily_pct"] = float(pct_token.lstrip("+"))
+                except (IndexError, ValueError):
+                    pass
+        elif "Unrealized P&L" in line:
+            out["unrealized"] = _dollars(line)
+        elif "Realized P&L" in line:
+            out["realized"] = _dollars(line)
+    return out
+
+
+@dataclass
+class AccountView:
+    """Shared per-account fetch bundle used by /pnl, /positions, /trades,
+    /margin. All four commands need the summary + some subset of positions /
+    pnl / trades, so we fetch in parallel once and format separately."""
+
+    summary: Optional[dict]
+    positions: Optional[dict]
+    pnl_by_account: dict[str, str]
+    trades_by_account: dict[str, str]
+    fx_rates: dict[str, float]
+    healthy: bool
+    fetch_errors: list[str]
+    accounts: list[str]
+
+
+async def fetch_account_view(
+    mcp_url: str = MCP_DEFAULT_URL,
+    want_positions: bool = True,
+    want_pnl: bool = True,
+    want_trades: bool = True,
+) -> AccountView:
+    """Fetch whatever subset the caller needs — skips endpoints that aren't
+    required so /margin doesn't pay for positions, etc."""
+    errors: list[str] = []
+    async with aiohttp.ClientSession() as session:
+        health = await _fetch_json(session, f"{mcp_url}/api/health")
+        if not health or health.get("status") != "ok":
+            errors.append("mcp health check failed")
+            return AccountView(None, None, {}, {}, {}, False, errors, [])
+
+        accounts: list[str] = list(health.get("accounts", []))
+
+        summary_task = _fetch_json(session, f"{mcp_url}/api/summary")
+        fx_task = _fetch_json(session, f"{mcp_url}/api/prices?symbols=USDCAD=X")
+        tasks_map: dict[str, Any] = {"summary": summary_task, "fx": fx_task}
+
+        if want_positions:
+            tasks_map["positions"] = _fetch_json(session, f"{mcp_url}/api/positions")
+        if want_pnl:
+            for acct in accounts:
+                tasks_map[f"pnl:{acct}"] = _fetch_json(
+                    session, f"{mcp_url}/api/account-pnl?account={acct}"
+                )
+        if want_trades:
+            for acct in accounts:
+                tasks_map[f"trades:{acct}"] = _fetch_json(
+                    session, f"{mcp_url}/api/trades?account={acct}"
+                )
+
+        keys = list(tasks_map.keys())
+        results = await asyncio.gather(*tasks_map.values())
+        by_key = dict(zip(keys, results))
+
+        summary = by_key.get("summary")
+        positions = by_key.get("positions")
+        fx_json = by_key.get("fx")
+
+        pnl_md: dict[str, str] = {}
+        trades_md: dict[str, str] = {}
+        for acct in accounts:
+            if want_pnl:
+                pnl_md[acct] = (by_key.get(f"pnl:{acct}") or {}).get("markdown", "")
+            if want_trades:
+                trades_md[acct] = (by_key.get(f"trades:{acct}") or {}).get("markdown", "")
+
+        fx_rates: dict[str, float] = {}
+        if fx_json and "prices" in fx_json:
+            usdcad_data = fx_json["prices"].get("USDCAD=X", {})
+            if "price" in usdcad_data:
+                fx_rates["USDCAD"] = float(usdcad_data["price"])
+
+        if summary is None:
+            errors.append("summary fetch failed")
+        if want_positions and positions is None:
+            errors.append("positions fetch failed")
+        if not fx_rates:
+            errors.append("fx fetch failed")
+
+        return AccountView(
+            summary=summary,
+            positions=positions,
+            pnl_by_account=pnl_md,
+            trades_by_account=trades_md,
+            fx_rates=fx_rates,
+            healthy=True,
+            fetch_errors=errors,
+            accounts=accounts,
+        )
+
+
+def _accounts_for(view: AccountView, requested: Optional[str]) -> tuple[list[str], Optional[str]]:
+    """Resolve an optional account filter against the discovered list.
+    Returns (accounts_to_render, error_message_or_None)."""
+    if requested is None:
+        return view.accounts, None
+    if requested in view.accounts:
+        return [requested], None
+    return [], f"unknown account `{requested}` — known: {', '.join(view.accounts) or '(none)'}"
+
+
+def build_pnl(view: AccountView, account: Optional[str] = None) -> str:
+    """Per-account daily/unrealized/realized P&L. CAD everywhere since that's
+    the reporting currency the MCP returns."""
+    if not view.healthy:
+        return "⚠️ pnl unavailable — ibkr mcp not responding."
+
+    accounts, err = _accounts_for(view, account)
+    if err:
+        return err
+    if not accounts:
+        return "no accounts available"
+
+    lines: list[str] = ["```"]
+    usdcad = view.fx_rates.get("USDCAD")
+    if usdcad:
+        lines.append(f"all values CAD · USDCAD {usdcad:.4f}")
+        lines.append("")
+
+    summary_by_acct = {
+        a.get("account"): a for a in (view.summary or {}).get("accounts", [])
+    }
+
+    combined_daily = 0.0
+    combined_unreal = 0.0
+    combined_realized = 0.0
+    any_daily = False
+    any_unreal = False
+    any_realized = False
+
+    for i, acct in enumerate(accounts):
+        if i > 0:
+            lines.append("")
+        lines.append(acct)
+        parsed = _parse_pnl_markdown(view.pnl_by_account.get(acct, ""))
+        summary = summary_by_acct.get(acct) or {}
+        nlv = summary.get("nlv")
+
+        if nlv is not None:
+            lines.append(f"  nlv        {_money_cad_hi(nlv)}")
+        if parsed["daily"] is not None:
+            any_daily = True
+            combined_daily += parsed["daily"]
+            if parsed["daily_pct"] is not None:
+                lines.append(
+                    f"  day        {_money_cad_hi(parsed['daily'])} ({_pct(parsed['daily_pct'])})"
+                )
+            else:
+                lines.append(f"  day        {_money_cad_hi(parsed['daily'])}")
+        if parsed["unrealized"] is not None:
+            any_unreal = True
+            combined_unreal += parsed["unrealized"]
+            lines.append(f"  unrealized {_money_cad_hi(parsed['unrealized'])}")
+        if parsed["realized"] is not None:
+            any_realized = True
+            combined_realized += parsed["realized"]
+            lines.append(f"  realized   {_money_cad_hi(parsed['realized'])}")
+
+    # Combined totals only when rendering all accounts.
+    if account is None and len(accounts) > 1:
+        combined_nlv = (view.summary or {}).get("combined_nlv")
+        lines.append("")
+        lines.append("combined")
+        if combined_nlv is not None:
+            lines.append(f"  nlv        {_money_cad_hi(combined_nlv)}")
+        if any_daily:
+            pct = (combined_daily / combined_nlv * 100) if combined_nlv else 0.0
+            lines.append(f"  day        {_money_cad_hi(combined_daily)} ({_pct(pct)})")
+        if any_unreal:
+            lines.append(f"  unrealized {_money_cad_hi(combined_unreal)}")
+        if any_realized:
+            lines.append(f"  realized   {_money_cad_hi(combined_realized)}")
+
+    lines.append("```")
+    if view.fetch_errors:
+        lines.append(f"⚠️ partial: {', '.join(view.fetch_errors)}")
+    return "\n".join(lines)
+
+
+def _positions_for_account(
+    positions_json: dict,
+    account: Optional[str],
+    fx: dict[str, float],
+) -> list[dict]:
+    """Positions combined across accounts (or filtered to one) and grouped by
+    (symbol, currency) so CDR listings stay distinct from US parents."""
+    by_key: dict[tuple[str, str], dict] = {}
+    for p in positions_json.get("positions", []):
+        if account is not None and p.get("account") != account:
+            continue
+        sym = p["symbol"]
+        ccy = p.get("currency", "USD")
+        key = (sym, ccy)
+        if key not in by_key:
+            by_key[key] = {
+                "symbol": sym,
+                "currency": ccy,
+                "shares": 0.0,
+                "cost_total_native": 0.0,
+                "market_value_native": 0.0,
+                "unrealized_pnl_native": 0.0,
+            }
+        row = by_key[key]
+        shares = float(p.get("shares", 0))
+        avg_cost = float(p.get("avg_cost", 0))
+        row["shares"] += shares
+        row["cost_total_native"] += shares * avg_cost
+        row["market_value_native"] += float(p.get("market_value", 0))
+        row["unrealized_pnl_native"] += float(p.get("unrealized_pnl", 0))
+
+    out = []
+    for (sym, ccy), r in by_key.items():
+        avg_native = (r["cost_total_native"] / r["shares"]) if r["shares"] else 0.0
+        unreal_pct = (
+            (r["unrealized_pnl_native"] / r["cost_total_native"] * 100)
+            if r["cost_total_native"] else 0.0
+        )
+        label = sym if ccy == "USD" else f"{sym}(C)"
+        out.append({
+            "label": label,
+            "symbol": sym,
+            "currency": ccy,
+            "shares": r["shares"],
+            "avg_cost_cad": _fx_to_cad(avg_native, ccy, fx),
+            "market_value_cad": _fx_to_cad(r["market_value_native"], ccy, fx),
+            "unrealized_pnl_cad": _fx_to_cad(r["unrealized_pnl_native"], ccy, fx),
+            "unrealized_pct": unreal_pct,
+        })
+    out.sort(key=lambda r: r["market_value_cad"], reverse=True)
+    return out
+
+
+def build_positions(
+    view: AccountView,
+    account: Optional[str] = None,
+    top_n: int = 10,
+) -> str:
+    """Positions view with cost basis, mv, unrealized P&L + %. Defaults to top
+    10 across all accounts; narrower than /brief which caps at 5."""
+    if not view.healthy:
+        return "⚠️ positions unavailable — ibkr mcp not responding."
+    if view.positions is None:
+        return "⚠️ positions fetch failed"
+
+    accounts, err = _accounts_for(view, account)
+    if err:
+        return err
+
+    filter_acct = account if account is not None else None
+    rows = _positions_for_account(view.positions, filter_acct, view.fx_rates)[:top_n]
+    if not rows:
+        return f"no positions {'for ' + account if account else 'found'}"
+
+    lines: list[str] = ["```"]
+    usdcad = view.fx_rates.get("USDCAD")
+    scope = account if account else "all accounts"
+    header = f"positions · {scope}"
+    if usdcad:
+        header += f" · USDCAD {usdcad:.4f}"
+    lines.append(header)
+    lines.append("")
+    lines.append(f"{'sym':<7} {'shares':>7} {'avg':>7} {'mv':>7} {'pnl':>8} {'%':>7}")
+    for r in rows:
+        label = r["label"][:7]
+        shares = f"{int(r['shares']):,}"
+        avg = f"${r['avg_cost_cad']:,.0f}"
+        mv = _money_cad(r["market_value_cad"])
+        pnl = _money_cad(r["unrealized_pnl_cad"])
+        pct = _pct(r["unrealized_pct"])
+        lines.append(f"{label:<7} {shares:>7} {avg:>7} {mv:>7} {pnl:>8} {pct:>7}")
+    lines.append("```")
+    if view.fetch_errors:
+        lines.append(f"⚠️ partial: {', '.join(view.fetch_errors)}")
+    return "\n".join(lines)
+
+
+def build_trades(view: AccountView, account: Optional[str] = None) -> str:
+    """Dump today's executions per account. The MCP already returns a neatly
+    formatted markdown table — we just concatenate with a header per account."""
+    if not view.healthy:
+        return "⚠️ trades unavailable — ibkr mcp not responding."
+
+    accounts, err = _accounts_for(view, account)
+    if err:
+        return err
+    if not accounts:
+        return "no accounts available"
+
+    chunks: list[str] = []
+    any_trades = False
+    for acct in accounts:
+        md = (view.trades_by_account.get(acct) or "").strip()
+        if not md:
+            continue
+        chunks.append(f"**{acct}**")
+        chunks.append(md)
+        chunks.append("")
+        if "No executions" not in md:
+            any_trades = True
+
+    if not chunks:
+        return "no trade data available"
+    if not any_trades:
+        # All accounts reported "No executions this session."
+        return "no executions this session"
+
+    out = "\n".join(chunks).rstrip()
+    if view.fetch_errors:
+        out += f"\n⚠️ partial: {', '.join(view.fetch_errors)}"
+    return out
+
+
+def build_margin(view: AccountView, account: Optional[str] = None) -> str:
+    """Margin close-up: init/maint margin, cushion, excess liq, bp, leverage,
+    utilization %. Pulls everything from the summary payload."""
+    if not view.healthy or view.summary is None:
+        return "⚠️ margin unavailable — ibkr mcp not responding."
+
+    accounts, err = _accounts_for(view, account)
+    if err:
+        return err
+
+    by_acct = {a.get("account"): a for a in view.summary.get("accounts", [])}
+    if account is not None and account not in by_acct:
+        return f"no summary for `{account}`"
+
+    render_accts = [account] if account else list(by_acct.keys())
+    if not render_accts:
+        return "no accounts available"
+
+    lines: list[str] = ["```"]
+    lines.append("all values CAD")
+    lines.append("")
+
+    for i, acct_id in enumerate(render_accts):
+        if i > 0:
+            lines.append("")
+        a = by_acct.get(acct_id) or {}
+        if not a:
+            lines.append(f"{acct_id}")
+            lines.append(f"  ⚠️ data unavailable")
+            continue
+        cushion = a.get("cushion_pct", 0)
+        cushion_tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
+        lines.append(f"{acct_id}")
+        lines.append(f"  nlv         {_money_cad_hi(a.get('nlv', 0))}")
+        lines.append(f"  gpv         {_money_cad_hi(a.get('gpv', 0))}")
+        lines.append(f"  init margin {_money_cad_hi(a.get('init_margin', 0))}")
+        lines.append(f"  maint       {_money_cad_hi(a.get('maint_margin', 0))}")
+        lines.append(f"  excess liq  {_money_cad_hi(a.get('excess_liquidity', 0))}")
+        lines.append(f"  buying pwr  {_money_cad_hi(a.get('buying_power', 0))}")
+        lines.append(f"  cushion     {cushion:.1f}% ({cushion_tag})")
+        lines.append(f"  leverage    {a.get('leverage', 0):.2f}x")
+        lines.append(f"  margin util {a.get('margin_util_pct', 0):.1f}%")
+
+    lines.append("```")
+    if view.fetch_errors:
+        lines.append(f"⚠️ partial: {', '.join(view.fetch_errors)}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Health — gateway process state
 # ---------------------------------------------------------------------------
 
