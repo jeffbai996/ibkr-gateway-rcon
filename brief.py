@@ -552,8 +552,27 @@ def build_pnl(view: AccountView, account: Optional[str] = None) -> str:
         if i > 0:
             lines.append("")
         lines.append(acct)
-        parsed = _parse_pnl_markdown(view.pnl_by_account.get(acct, ""))
         summary = summary_by_acct.get(acct) or {}
+        # MCP subscription stale / reconnect race — surface honestly instead of
+        # rendering $0s that look like real numbers.
+        if summary.get("error") or summary.get("nlv") is None:
+            err = summary.get("error", "data unavailable")
+            lines.append(f"  ⚠️ {err}")
+            continue
+
+        parsed = _parse_pnl_markdown(view.pnl_by_account.get(acct, ""))
+        # Treat a trivially-zero P&L markdown block (all three fields zero or
+        # N/A) the same way — it means the account's subscription hasn't
+        # populated, not that P&L is actually zero.
+        looks_empty = (
+            parsed["daily"] is None
+            and (parsed["unrealized"] or 0) == 0
+            and (parsed["realized"] or 0) == 0
+        )
+        if looks_empty:
+            lines.append(f"  ⚠️ pnl data unavailable")
+            continue
+
         nlv = summary.get("nlv")
 
         if nlv is not None:
@@ -666,6 +685,17 @@ def build_positions(
     if err:
         return err
 
+    # If a specific account was asked for, check whether the summary for that
+    # account reports an error — in that case positions will be empty not
+    # because there are none, but because the subscription is stale. Surface
+    # that instead of lying with "no positions".
+    if account is not None and view.summary is not None:
+        summary_by_acct = {a.get("account"): a for a in view.summary.get("accounts", [])}
+        a = summary_by_acct.get(account) or {}
+        if a.get("error") or a.get("nlv") is None:
+            err_msg = a.get("error", "data unavailable")
+            return f"⚠️ {account}: {err_msg}"
+
     filter_acct = account if account is not None else None
     rows = _positions_for_account(view.positions, filter_acct, view.fx_rates)[:top_n]
     if not rows:
@@ -706,22 +736,37 @@ def build_trades(view: AccountView, account: Optional[str] = None) -> str:
     if not accounts:
         return "no accounts available"
 
+    # Any account whose summary reports an error gets flagged — "No executions"
+    # from a disconnected account is misleading (we don't actually know).
+    summary_by_acct: dict[str, dict] = {}
+    if view.summary is not None:
+        summary_by_acct = {a.get("account"): a for a in view.summary.get("accounts", [])}
+
     chunks: list[str] = []
     any_trades = False
+    all_flagged = True
     for acct in accounts:
+        a = summary_by_acct.get(acct) or {}
+        if a.get("error") or (a and a.get("nlv") is None):
+            err_msg = a.get("error", "data unavailable")
+            chunks.append(f"**{acct}**")
+            chunks.append(f"⚠️ {err_msg} (trade data not reliable)")
+            chunks.append("")
+            continue
+
         md = (view.trades_by_account.get(acct) or "").strip()
         if not md:
             continue
         chunks.append(f"**{acct}**")
         chunks.append(md)
         chunks.append("")
+        all_flagged = False
         if "No executions" not in md:
             any_trades = True
 
     if not chunks:
         return "no trade data available"
-    if not any_trades:
-        # All accounts reported "No executions this session."
+    if not any_trades and not all_flagged:
         return "no executions this session"
 
     out = "\n".join(chunks).rstrip()
@@ -756,13 +801,16 @@ def build_margin(view: AccountView, account: Optional[str] = None) -> str:
         if i > 0:
             lines.append("")
         a = by_acct.get(acct_id) or {}
-        if not a:
-            lines.append(f"{acct_id}")
-            lines.append(f"  ⚠️ data unavailable")
+        lines.append(f"{acct_id}")
+        # MCP returns {"account": X, "error": "No summary available"} when the
+        # ib_insync subscription hasn't populated for this account. Surface
+        # the real reason instead of rendering zeros that look like collapse.
+        if not a or a.get("error") or a.get("nlv") is None:
+            err = a.get("error", "data unavailable")
+            lines.append(f"  ⚠️ {err}")
             continue
         cushion = a.get("cushion_pct", 0)
         cushion_tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
-        lines.append(f"{acct_id}")
         lines.append(f"  nlv         {_money_cad_hi(a.get('nlv', 0))}")
         lines.append(f"  gpv         {_money_cad_hi(a.get('gpv', 0))}")
         lines.append(f"  init margin {_money_cad_hi(a.get('init_margin', 0))}")
@@ -791,6 +839,8 @@ class HealthData:
     restarts_last_24h: dict[str, int]
     last_restart_per_gateway: dict[str, Optional[datetime]]
     watchdog_interval_s: int
+    mcp_per_gateway: dict[str, dict] = None  # type: ignore[assignment]
+    account_errors: list[str] = None  # type: ignore[assignment]
 
 
 def fetch_health_data(
@@ -799,6 +849,8 @@ def fetch_health_data(
     heartbeat_path: Path,
     watchdog_interval_s: int,
     now: datetime,
+    mcp_per_gateway: Optional[dict[str, dict]] = None,
+    account_errors: Optional[list[str]] = None,
 ) -> HealthData:
     statuses = [
         gc.status_for(gw, port_listening=port_listening, log_path=cfg.log_file, now=now)
@@ -837,7 +889,33 @@ def fetch_health_data(
         restarts_last_24h=dict(restarts_24h),
         last_restart_per_gateway=last_restart,
         watchdog_interval_s=watchdog_interval_s,
+        mcp_per_gateway=mcp_per_gateway or {},
+        account_errors=account_errors or [],
     )
+
+
+async def fetch_mcp_status(mcp_url: str = MCP_DEFAULT_URL) -> tuple[dict[str, dict], list[str]]:
+    """Pull per-gateway MCP connection state + any account-level subscription
+    errors. Returns ({gateway_name: {connected, last_data_age_s}}, [error_msg]).
+    Both empty on any failure — caller treats that as 'mcp didn't answer'."""
+    async with aiohttp.ClientSession() as session:
+        health = await _fetch_json(session, f"{mcp_url}/api/health")
+        summary = await _fetch_json(session, f"{mcp_url}/api/summary")
+
+    per_gw: dict[str, dict] = {}
+    if health:
+        for key in ("primary", "secondary"):
+            if isinstance(health.get(key), dict):
+                per_gw[key] = health[key]
+
+    errs: list[str] = []
+    if summary:
+        for a in summary.get("accounts", []):
+            if a.get("error"):
+                errs.append(f"{a.get('account', '?')}: {a['error']}")
+            elif a.get("nlv") is None:
+                errs.append(f"{a.get('account', '?')}: data unavailable")
+    return per_gw, errs
 
 
 def _fmt_age(seconds: float) -> str:
@@ -878,6 +956,24 @@ def build_health(data: HealthData, now: datetime) -> str:
         lines.append(f"{st.name} (port {st.port})")
         lines.append(f"  state:   {state}")
 
+        # MCP-layer view of this gateway: TCP connected + how fresh the last
+        # data packet was. This is the piece that catches "port open but
+        # subscription dead" — the wifey's-gateway failure mode.
+        mcp_info = (data.mcp_per_gateway or {}).get(st.name)
+        if mcp_info is not None:
+            if not mcp_info.get("connected"):
+                lines.append(f"  mcp:     disconnected")
+            else:
+                age = mcp_info.get("last_data_age_s")
+                if age is None:
+                    lines.append(f"  mcp:     connected")
+                elif age < 60:
+                    lines.append(f"  mcp:     connected ({int(age)}s data)")
+                elif age < 600:
+                    lines.append(f"  mcp:     connected ({int(age/60)}m data)")
+                else:
+                    lines.append(f"  mcp:     STALE ({_fmt_age(age)} data)")
+
         if st.skipped:
             if st.skipped_until is None:
                 lines.append(f"  watchdog paused indefinitely")
@@ -904,6 +1000,16 @@ def build_health(data: HealthData, now: datetime) -> str:
             delta = (now - last).total_seconds()
             lines.append(f"  last restart {_fmt_age(delta)} ago")
         lines.append(f"  restarts in last 24h: {restarts}")
+
+    # Account-level subscription health — a gateway can be "connected" at the
+    # TCP level but still have a dead accountSummary subscription for one or
+    # both accounts. Flag it clearly so it doesn't look like the gateway is
+    # fine when /pnl and /margin know it isn't.
+    if data.account_errors:
+        lines.append("")
+        lines.append("account subscriptions:")
+        for e in data.account_errors:
+            lines.append(f"  ⚠️ {e}")
 
     lines.append("```")
     return "\n".join(lines)
