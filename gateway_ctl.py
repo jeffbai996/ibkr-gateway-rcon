@@ -396,16 +396,51 @@ def resume(gw: GatewayConfig) -> None:
     clear_skip(gw.skip_file)
 
 
+# Matches `<maybe-path>cmd.exe /c <body>` and captures the body. Anchors on
+# cmd.exe so we leave non-Windows commands alone. Accepts both bare "cmd.exe"
+# and absolute WSL paths like /mnt/c/Windows/system32/cmd.exe.
+_CMD_EXE_RE = re.compile(r'(?P<prefix>(?:^|.*?\s)(?:/\S+/)?cmd\.exe)\s+/c\s+(?P<body>.+)$', re.DOTALL)
+
+
+def _wrap_wsl_cmd(cmd: str) -> str:
+    """Rewrite `cmd.exe /c <body>` to `cmd.exe /c "start "" /MIN cmd /c <body>"`.
+
+    Needed when invoking Windows batch files that spawn long-lived GUI
+    processes (IBGateway) from WSL. Without `start`, the grandchild java
+    process inherits the parent cmd.exe's handles through the WSL bridge,
+    and subprocess.run blocks until its timeout even though the launched
+    process is happy and the bat file itself has exited. `start "" /MIN`
+    detaches the bat into a separate cmd.exe that Windows can reap
+    independently, so the outer cmd.exe exits in ~3s.
+
+    Passthrough for anything that doesn't match the cmd.exe pattern.
+    Idempotent: if `start` is already in the body, leave it alone.
+    """
+    m = _CMD_EXE_RE.match(cmd)
+    if not m:
+        return cmd
+    body = m.group("body").strip()
+    # Strip surrounding quotes so we can re-quote uniformly
+    if len(body) >= 2 and body[0] == body[-1] and body[0] in '"\'':
+        body = body[1:-1]
+    if body.lstrip().lower().startswith("start "):
+        return cmd  # already wrapped
+    prefix = m.group("prefix")
+    return f'{prefix} /c "start "" /MIN cmd /c "{body}""'
+
+
 def _run(cmd: str, timeout: int) -> subprocess.CompletedProcess:
     """Run a shell command with a timeout, wrapping TimeoutExpired into a
-    returncode=-1 CompletedProcess instead of raising."""
+    returncode=-1 CompletedProcess instead of raising. Rewrites cmd.exe /c
+    invocations so they detach cleanly from the WSL bridge."""
+    effective = _wrap_wsl_cmd(cmd)
     try:
         return subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            effective, shell=True, capture_output=True, text=True, timeout=timeout
         )
     except subprocess.TimeoutExpired as e:
         return subprocess.CompletedProcess(
-            args=cmd,
+            args=effective,
             returncode=-1,
             stdout=(e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")),
             stderr=f"command timed out after {timeout}s",
