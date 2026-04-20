@@ -463,7 +463,7 @@ def build_bot() -> discord.Client:
         await interaction.followup.send(out)
 
     @group.command(name="pnl", description="Per-account P&L breakdown — daily, unrealized, realized")
-    @app_commands.describe(account="Account ID (e.g. U18542138). Omit for all.")
+    @app_commands.describe(account="Account ID (e.g. U12345678). Omit for all.")
     async def pnl_cmd(
         interaction: discord.Interaction,
         account: Optional[str] = None,
