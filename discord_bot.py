@@ -94,8 +94,14 @@ def _fmt_until_relative(dt: datetime, now: datetime) -> str:
     return f"for {delta / 86400:.1f}d more"
 
 
-def _fmt_status(cfg: gc.Config) -> str:
-    """One block per gateway, stacked, <40 chars. Relative times for clarity."""
+def _fmt_status(cfg: gc.Config, mcp_per_gw: Optional[dict] = None) -> str:
+    """One block per gateway, stacked, <40 chars. Relative times for clarity.
+
+    `state:` reflects TCP port listening (gateway process state). The new
+    `mcp:` line reflects whether the MCP server can actually reach that
+    gateway — port-listening alone misses the "zombie process" case where
+    the gateway holds the socket but can't serve API calls.
+    """
     probe = gc.make_port_probe(cfg.port_probe)
     now = _now()
     lines = ["```"]
@@ -116,14 +122,46 @@ def _fmt_status(cfg: gc.Config) -> str:
         else:
             last_line = f"last restart {_fmt_age_relative(st.last_restart_at, now)}"
 
+        # MCP reachability: the truth-teller. Port listening != service healthy.
+        mcp_line = None
+        if mcp_per_gw is not None:
+            mcp_info = mcp_per_gw.get(gw.name)
+            if mcp_info is None:
+                mcp_line = "mcp: unknown"
+            elif not mcp_info.get("connected"):
+                mcp_line = "mcp: disconnected"
+            else:
+                age = mcp_info.get("last_data_age_s")
+                if age is None:
+                    mcp_line = "mcp: connected"
+                elif age < 60:
+                    mcp_line = f"mcp: connected ({int(age)}s data)"
+                elif age < 600:
+                    mcp_line = f"mcp: connected ({int(age/60)}m data)"
+                else:
+                    mcp_line = f"mcp: STALE ({_fmt_age_relative_short(age)} data)"
+
         if i > 0:
             lines.append("")
         lines.append(f"{gw.name} (port {gw.port})")
         lines.append(f"  state:   {state}")
+        if mcp_line is not None:
+            lines.append(f"  {mcp_line}")
         lines.append(f"  {pause_line}")
         lines.append(f"  {last_line}")
     lines.append("```")
     return "\n".join(lines)
+
+
+def _fmt_age_relative_short(seconds: float) -> str:
+    """Compact age for the STALE-data case: '5m', '2h', '1.3d'."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds / 60)}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
 
 
 ALL_SENTINEL = "__all__"
@@ -209,7 +247,15 @@ def build_bot() -> discord.Client:
     async def status(interaction: discord.Interaction):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        await interaction.response.send_message(_fmt_status(cfg))
+        # Defer so the MCP probe doesn't race the 3s interaction timeout.
+        await interaction.response.defer(thinking=True)
+        # MCP probe is best-effort — if it fails, we still render the
+        # process-level state, just without the mcp: line.
+        try:
+            mcp_per_gw, _ = await bf.fetch_mcp_status(bf.mcp_url_from_env())
+        except Exception:
+            mcp_per_gw = None
+        await interaction.followup.send(_fmt_status(cfg, mcp_per_gw))
 
     def _targets_from_choice(choice: Optional[app_commands.Choice[str]]) -> list[gc.GatewayConfig]:
         """If no choice was made, default to every gateway."""
