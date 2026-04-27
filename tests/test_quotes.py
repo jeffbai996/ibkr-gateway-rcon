@@ -84,3 +84,30 @@ def test_fmt_quote_price_thresholds():
     assert bf._fmt_quote_price(1832.10) == "$1,832.10"
     assert bf._fmt_quote_price(89.42) == "$89.42"
     assert bf._fmt_quote_price(0.42) == "$0.4200"
+
+
+def test_build_quotes_non_numeric_price_treated_as_missing():
+    """A symbol with a sentinel price like 'N/A' should not crash the whole
+    response — render it as missing data and continue with other symbols."""
+    prices = {
+        "MU":  {"price": 89.42, "change_pct": 1.2},
+        "BAD": {"price": "N/A"},
+    }
+    out = bf.build_quotes(["MU", "BAD"], prices, [])
+    assert "$89.42" in out
+    assert "no data: BAD" in out
+
+
+def test_build_quotes_non_numeric_change_pct_falls_back():
+    """A non-numeric change_pct should not abort — fall back to prev_close
+    if available, otherwise render '—'."""
+    prices = {
+        "MU":  {"price": 88.0, "change_pct": "", "prev_close": 80.0},
+        "GENERIC": {"price": 100.0, "change_pct": "N/A"},
+    }
+    out = bf.build_quotes(["MU", "GENERIC"], prices, [])
+    # MU should compute from prev_close: 88 / 80 → +10.00%
+    assert "+10.00%" in out
+    # GENERIC has no usable change data → dash, but price still renders
+    assert "$100.00" in out
+    assert "—" in out

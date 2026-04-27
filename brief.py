@@ -1062,21 +1062,29 @@ def build_quotes(
     missing: list[str] = []
     for sym in symbols:
         info = prices.get(sym) or prices.get(sym.upper()) or {}
-        price = info.get("price")
+        raw_price = info.get("price")
+        try:
+            price = float(raw_price) if raw_price is not None else None
+        except (TypeError, ValueError):
+            price = None
         if price is None:
             missing.append(sym)
             lines.append(f"{sym[:5]:<5} {'—':>10} {'—':>7}")
             continue
-        price = float(price)
-        chg_pct = info.get("change_pct")
+        chg_pct: Optional[float]
+        try:
+            raw_chg = info.get("change_pct")
+            chg_pct = float(raw_chg) if raw_chg is not None and raw_chg != "" else None
+        except (TypeError, ValueError):
+            chg_pct = None
         if chg_pct is None:
             prev = info.get("prev_close")
-            if prev:
+            if prev not in (None, ""):
                 try:
                     chg_pct = (price - float(prev)) / float(prev) * 100
                 except (TypeError, ValueError, ZeroDivisionError):
                     chg_pct = None
-        chg_str = _pct(float(chg_pct)) if chg_pct is not None else "—"
+        chg_str = _pct(chg_pct) if chg_pct is not None else "—"
         lines.append(f"{sym[:5]:<5} {_fmt_quote_price(price):>10} {chg_str:>7}")
 
     lines.append("```")
