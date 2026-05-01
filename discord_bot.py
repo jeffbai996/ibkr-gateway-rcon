@@ -32,6 +32,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -318,6 +319,9 @@ def build_bot() -> discord.Client:
         targets = _targets_from_choice(name)
         if not targets:
             return await interaction.response.send_message("No gateways configured.", ephemeral=True)
+        target_names = [g.name for g in targets]
+        log.info("/gateway restart fired by %s in %s — targets=%s",
+                 interaction.user, interaction.channel_id, target_names)
         await interaction.response.defer(thinking=True)
 
         # Clear any skip-files first — a restart is an explicit "bring this
@@ -329,10 +333,15 @@ def build_bot() -> discord.Client:
         # If the port is down, runs start_cmd (or restart_cmd as fallback).
         # That way "restart" is always the user's mental model regardless of
         # current state.
+        t0 = time.monotonic()
         results = await asyncio.gather(
             *[asyncio.to_thread(gc.smart_restart, gw, probe) for gw in targets],
             return_exceptions=False,
         )
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        for gw, res in zip(targets, results):
+            log.info("smart_restart(%s) returned exit=%s in %dms",
+                     gw.name, res.returncode, elapsed_ms)
 
         parts: list[str] = []
         for gw, res in zip(targets, results):
@@ -348,7 +357,20 @@ def build_bot() -> discord.Client:
         summary = header + "\n" + "\n".join(parts)
         if len(summary) > 1900:
             summary = summary[:1900] + "…"
-        await interaction.followup.send(summary)
+        try:
+            await interaction.followup.send(summary)
+            log.info("/gateway restart followup delivered (%d chars)", len(summary))
+        except discord.NotFound as e:
+            # Interaction token went stale before subprocess returned — typical
+            # when smart_restart blocks past Discord's 15min webhook window or
+            # the user dismisses the loading bubble. The work succeeded; user
+            # just won't see the result inline.
+            log.error("/gateway restart followup 404 (interaction expired) "
+                     "after %dms — work completed but user got no reply: %s",
+                     elapsed_ms, e)
+        except Exception:
+            log.exception("/gateway restart followup.send failed")
+            raise
 
     @group.command(name="stop", description="Stop gateway now")
     @app_commands.describe(name="Gateway to stop. Omit to stop every gateway.")
