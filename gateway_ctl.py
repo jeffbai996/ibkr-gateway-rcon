@@ -10,6 +10,7 @@ import logging
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -445,6 +446,86 @@ def _run(cmd: str, timeout: int) -> subprocess.CompletedProcess:
             stdout=(e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")),
             stderr=f"command timed out after {timeout}s",
         )
+
+
+def _fire_async(cmd: str) -> subprocess.Popen:
+    """Spawn a shell command in a detached session and return immediately.
+
+    The subprocess is fully decoupled from the parent's process group via
+    `start_new_session=True`, so the parent can return without waiting for
+    cmd.exe to exit. stdout/stderr are pinned to /dev/null because nobody
+    will read them.
+
+    Use this when you want to FIRE the restart command and verify success
+    via port probing rather than via subprocess exit code — see
+    `smart_restart_async`. Avoids the WSL bridge wait that pinned the
+    bot's interaction handler past Discord's 15min webhook window when
+    the cmd.exe stayed alive (see commit 73c2cfe + this file's history).
+    """
+    effective = _wrap_wsl_cmd(cmd)
+    return subprocess.Popen(
+        effective,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def smart_restart_async(
+    gw: GatewayConfig,
+    port_listening: Callable[[int], bool],
+    success_wait_s: float = 10.0,
+    poll_interval_s: float = 1.0,
+) -> dict:
+    """Fire the restart/start command without blocking, then poll the port
+    for `success_wait_s` seconds to see if the gateway came up.
+
+    Returns a dict with:
+      - `fired`: True if the subprocess was spawned (always True unless
+        spawn itself raises)
+      - `port_up`: True if port was listening within success_wait_s
+      - `was_already_up`: True if the port was already listening before we
+        fired (restart semantics — gateway is bouncing, won't come back up
+        within 10s, expect false)
+      - `pid`: the spawned subprocess PID
+      - `elapsed_ms`: ms spent in the polling phase
+
+    For cold starts, port_up will typically be True within a few seconds
+    (gateway hasn't had to JVM-warmup). For hot restarts, port_up will be
+    False at the 10s mark because IBKey auth takes 2-3min — caller should
+    surface this as "restart fired, watch the watchdog/heartbeat for
+    confirmation" rather than as a failure.
+    """
+    was_up_before = port_listening(gw.port)
+    cmd = gw.restart_cmd
+    if not was_up_before and gw.start_cmd:
+        # Port is down — prefer cold start path so JVM warmup is on a clean
+        # process tree.
+        cmd = gw.start_cmd
+    proc = _fire_async(cmd)
+    t0 = time.monotonic()
+    deadline = t0 + success_wait_s
+    port_up = False
+    while time.monotonic() < deadline:
+        if port_listening(gw.port) and not was_up_before:
+            # Port came up after we fired (cold start case)
+            port_up = True
+            break
+        # On hot restarts, port goes DOWN then comes back UP. We don't
+        # check the down→up transition because IBKey auth takes minutes.
+        # Caller infers success from "fired without spawn error" + the
+        # watchdog's eventual restart count increment.
+        time.sleep(poll_interval_s)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return {
+        "fired": True,
+        "port_up": port_up,
+        "was_already_up": was_up_before,
+        "pid": proc.pid,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def restart(gw: GatewayConfig, timeout: int = 240) -> subprocess.CompletedProcess:

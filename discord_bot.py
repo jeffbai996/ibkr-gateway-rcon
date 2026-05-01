@@ -329,29 +329,40 @@ def build_bot() -> discord.Client:
         for gw in targets:
             gc.resume(gw)
 
-        # smart_restart: if the gateway is already running, runs restart_cmd.
-        # If the port is down, runs start_cmd (or restart_cmd as fallback).
-        # That way "restart" is always the user's mental model regardless of
-        # current state.
+        # smart_restart_async: fire the restart/start command in a detached
+        # session, then poll the port for ~10s. Returns immediately after
+        # success-or-timeout instead of blocking 240s on cmd.exe like the old
+        # smart_restart did. For hot restarts the port doesn't come back up
+        # within 10s (IBKey + JVM warmup is 2-3min), so port_up=False is
+        # expected — the watchdog confirms via heartbeat. Critical: keeps the
+        # Discord interaction token alive so followup.send() always lands.
         t0 = time.monotonic()
         results = await asyncio.gather(
-            *[asyncio.to_thread(gc.smart_restart, gw, probe) for gw in targets],
+            *[asyncio.to_thread(gc.smart_restart_async, gw, probe) for gw in targets],
             return_exceptions=False,
         )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         for gw, res in zip(targets, results):
-            log.info("smart_restart(%s) returned exit=%s in %dms",
-                     gw.name, res.returncode, elapsed_ms)
+            log.info("smart_restart_async(%s) fired pid=%s port_up=%s "
+                     "was_already_up=%s in %dms",
+                     gw.name, res["pid"], res["port_up"],
+                     res["was_already_up"], res["elapsed_ms"])
 
         parts: list[str] = []
         for gw, res in zip(targets, results):
-            if res.returncode == 0:
-                parts.append(f"✅ `{gw.name}`: exit 0")
+            if res["port_up"]:
+                # Cold start case — port came up within the 10s wait.
+                parts.append(f"✅ `{gw.name}`: up (cold start)")
+            elif res["was_already_up"]:
+                # Hot restart — port was up, fired restart, port hasn't come
+                # back yet (expected; takes 2-3min).
+                parts.append(f"🔄 `{gw.name}`: restart fired (was running) "
+                            f"— watchdog will confirm in ~2-3min")
             else:
-                parts.append(f"⚠️ `{gw.name}`: exit {res.returncode}")
-                tail = (res.stderr or res.stdout or "").strip()
-                if tail:
-                    parts.append(f"```{tail[-500:]}```")
+                # Cold start, port hasn't come up in 10s. May still be
+                # warming up — watchdog will catch it.
+                parts.append(f"⏳ `{gw.name}`: start fired (port still down) "
+                            f"— watchdog will retry if it doesn't come up")
 
         header = "restart issued for " + ", ".join(f"`{g.name}`" for g in targets)
         summary = header + "\n" + "\n".join(parts)
