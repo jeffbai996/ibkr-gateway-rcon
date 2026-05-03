@@ -152,7 +152,7 @@ def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
 
     Keeps CDR listings (CAD) as separate rows from their US parents — trying
     to merge them is meaningless because they have different shares-per-unit.
-    Label with '(C)' for non-USD listings so Jeff can spot them.
+    Label with '(C)' for non-USD listings so they're easy to spot.
     """
     by_key: dict[tuple[str, str], dict] = {}
     for p in positions.get("positions", []):
@@ -253,8 +253,8 @@ def _money_cad(n: float) -> str:
 
 def _money_cad_hi(n: float) -> str:
     """Higher-precision variant — one extra decimal place. Used for the
-    account-level headline numbers (NLV, day P&L, liq, bp) where Jeff wants
-    finer resolution."""
+    account-level headline numbers (NLV, day P&L, liq, bp) where finer
+    resolution helps."""
     sign = "-" if n < 0 else ""
     a = abs(n)
     if a >= 1_000_000:
