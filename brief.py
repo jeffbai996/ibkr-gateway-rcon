@@ -183,7 +183,7 @@ def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
             (r["unrealized_pnl_native"] / r["cost_total_native"] * 100)
             if r["cost_total_native"] else 0.0
         )
-        # Display label: 'GENERIC' for USD, 'GENERIC(C)' for CAD (CDR-style).
+        # Display label: 'AAPL' for USD, 'AAPL(C)' for CAD (CDR-style).
         label = sym if ccy == "USD" else f"{sym}(C)"
         out.append({
             "label": label,

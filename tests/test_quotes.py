@@ -4,14 +4,14 @@ import brief as bf
 
 def test_build_quotes_basic_layout():
     prices = {
-        "MU":   {"price": 89.42, "change_pct": 1.2},
-        "GENERIC": {"price": 1832.10, "change_pct": -0.3},
-        "NVDA": {"price": 876.45, "change_pct": 0.5},
-        "GOOG": {"price": 145.22, "change_pct": -0.1},
+        "AAPL": {"price": 89.42, "change_pct": 1.2},
+        "MSFT": {"price": 1832.10, "change_pct": -0.3},
+        "TSLA": {"price": 876.45, "change_pct": 0.5},
+        "AMZN": {"price": 145.22, "change_pct": -0.1},
     }
-    out = bf.build_quotes(["MU", "GENERIC", "NVDA", "GOOG"], prices, [])
-    assert "MU" in out
-    assert "GENERIC" in out
+    out = bf.build_quotes(["AAPL", "MSFT", "TSLA", "AMZN"], prices, [])
+    assert "AAPL" in out
+    assert "MSFT" in out
     assert "+1.20%" in out
     assert "-0.30%" in out
     assert "$89.42" in out
@@ -21,10 +21,10 @@ def test_build_quotes_basic_layout():
 def test_build_quotes_mobile_width():
     """Every line must fit a narrow mobile code block (≤ 32 chars)."""
     prices = {
-        "MU":   {"price": 89.42, "change_pct": 1.2},
-        "GENERIC": {"price": 1832.10, "change_pct": -0.3},
+        "AAPL": {"price": 89.42, "change_pct": 1.2},
+        "MSFT": {"price": 1832.10, "change_pct": -0.3},
     }
-    out = bf.build_quotes(["MU", "GENERIC"], prices, [])
+    out = bf.build_quotes(["AAPL", "MSFT"], prices, [])
     for line in out.split("\n"):
         assert len(line) <= 32, f"line too wide ({len(line)}): {line!r}"
 
@@ -45,8 +45,8 @@ def test_build_quotes_preserves_user_order():
 
 
 def test_build_quotes_missing_symbol():
-    prices = {"MU": {"price": 89.42, "change_pct": 1.2}}
-    out = bf.build_quotes(["MU", "ZZZ"], prices, [])
+    prices = {"AAPL": {"price": 89.42, "change_pct": 1.2}}
+    out = bf.build_quotes(["AAPL", "ZZZ"], prices, [])
     assert "no data: ZZZ" in out
     # The row still renders with placeholders
     assert "ZZZ" in out
@@ -54,22 +54,22 @@ def test_build_quotes_missing_symbol():
 
 
 def test_build_quotes_computes_pct_from_prev_close():
-    prices = {"MU": {"price": 88.0, "prev_close": 80.0}}
-    out = bf.build_quotes(["MU"], prices, [])
+    prices = {"AAPL": {"price": 88.0, "prev_close": 80.0}}
+    out = bf.build_quotes(["AAPL"], prices, [])
     # 88 over 80 → +10.00%
     assert "+10.00%" in out
 
 
 def test_build_quotes_no_chg_data():
-    prices = {"MU": {"price": 89.42}}
-    out = bf.build_quotes(["MU"], prices, [])
+    prices = {"AAPL": {"price": 89.42}}
+    out = bf.build_quotes(["AAPL"], prices, [])
     # No change_pct, no prev_close → render dash
     assert "$89.42" in out
     assert "—" in out
 
 
 def test_build_quotes_mcp_unreachable():
-    out = bf.build_quotes(["MU"], {}, ["mcp prices fetch failed"])
+    out = bf.build_quotes(["AAPL"], {}, ["mcp prices fetch failed"])
     assert "⚠️" in out
     assert "fetch failed" in out
 
@@ -90,10 +90,10 @@ def test_build_quotes_non_numeric_price_treated_as_missing():
     """A symbol with a sentinel price like 'N/A' should not crash the whole
     response — render it as missing data and continue with other symbols."""
     prices = {
-        "MU":  {"price": 89.42, "change_pct": 1.2},
-        "BAD": {"price": "N/A"},
+        "AAPL": {"price": 89.42, "change_pct": 1.2},
+        "BAD":  {"price": "N/A"},
     }
-    out = bf.build_quotes(["MU", "BAD"], prices, [])
+    out = bf.build_quotes(["AAPL", "BAD"], prices, [])
     assert "$89.42" in out
     assert "no data: BAD" in out
 
@@ -102,12 +102,12 @@ def test_build_quotes_non_numeric_change_pct_falls_back():
     """A non-numeric change_pct should not abort — fall back to prev_close
     if available, otherwise render '—'."""
     prices = {
-        "MU":  {"price": 88.0, "change_pct": "", "prev_close": 80.0},
-        "GENERIC": {"price": 100.0, "change_pct": "N/A"},
+        "AAPL": {"price": 88.0, "change_pct": "", "prev_close": 80.0},
+        "MSFT": {"price": 100.0, "change_pct": "N/A"},
     }
-    out = bf.build_quotes(["MU", "GENERIC"], prices, [])
-    # MU should compute from prev_close: 88 / 80 → +10.00%
+    out = bf.build_quotes(["AAPL", "MSFT"], prices, [])
+    # AAPL should compute from prev_close: 88 / 80 → +10.00%
     assert "+10.00%" in out
-    # GENERIC has no usable change data → dash, but price still renders
+    # MSFT has no usable change data → dash, but price still renders
     assert "$100.00" in out
     assert "—" in out
