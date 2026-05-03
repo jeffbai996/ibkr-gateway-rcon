@@ -6,6 +6,7 @@ Exposes:
     /gateway resume   <name>
     /gateway restart  <name>
     /gateway tail     [n]
+    /gateway quote    <symbols>
 
 In addition to the slash-command UI, this bot runs the watchdog logic
 internally via a background task that ticks every WATCHDOG_INTERVAL_SEC
@@ -576,6 +577,30 @@ def build_bot() -> discord.Client:
             want_trades=False,
         )
         out = bf.build_margin(view, account=account)
+        if len(out) > 1950:
+            out = out[:1950] + "…"
+        await interaction.followup.send(out)
+
+    @group.command(name="quote", description="Live quotes for symbols (e.g. mu avgo nvda goog)")
+    @app_commands.describe(symbols="Space- or comma-separated tickers, max 10")
+    async def quote_cmd(
+        interaction: discord.Interaction,
+        symbols: str,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+
+        syms = [s.strip().upper() for s in symbols.replace(",", " ").split() if s.strip()]
+        if not syms:
+            return await interaction.followup.send(
+                "usage: `/gateway quote mu avgo nvda goog`"
+            )
+        if len(syms) > 10:
+            return await interaction.followup.send("max 10 symbols.")
+
+        prices, errors = await bf.fetch_quotes(syms, bf.mcp_url_from_env())
+        out = bf.build_quotes(syms, prices, errors)
         if len(out) > 1950:
             out = out[:1950] + "…"
         await interaction.followup.send(out)

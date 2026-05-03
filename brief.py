@@ -1015,5 +1015,83 @@ def build_health(data: HealthData, now: datetime) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Quotes — live prices for arbitrary symbols
+# ---------------------------------------------------------------------------
+
+
+def _fmt_quote_price(n: float) -> str:
+    if n >= 1000:
+        return f"${n:,.2f}"
+    if n >= 1:
+        return f"${n:.2f}"
+    return f"${n:.4f}"
+
+
+async def fetch_quotes(
+    symbols: list[str],
+    mcp_url: str = MCP_DEFAULT_URL,
+) -> tuple[dict[str, dict], list[str]]:
+    """Fetch live quotes for the given symbols. Returns (prices_by_symbol,
+    errors). prices_by_symbol mirrors the MCP /api/prices response shape;
+    callers should defensively read fields since IBKR snapshots vary."""
+    if not symbols:
+        return {}, ["no symbols requested"]
+    syms_param = ",".join(symbols)
+    async with aiohttp.ClientSession() as session:
+        data = await _fetch_json(session, f"{mcp_url}/api/prices?symbols={syms_param}")
+    if not data or "prices" not in data:
+        return {}, ["mcp prices fetch failed"]
+    return data["prices"], []
+
+
+def build_quotes(
+    symbols: list[str],
+    prices: dict[str, dict],
+    errors: list[str],
+) -> str:
+    """Render a narrow 3-column quote table (sym / last / chg %). Preserves
+    the order the user typed. Symbols missing from the response render as '—'
+    and are listed in a footer."""
+    if errors and not prices:
+        return f"⚠️ quotes unavailable — {'; '.join(errors)}"
+
+    lines: list[str] = ["```"]
+    lines.append(f"{'sym':<5} {'last':>10} {'chg':>7}")
+
+    missing: list[str] = []
+    for sym in symbols:
+        info = prices.get(sym) or prices.get(sym.upper()) or {}
+        raw_price = info.get("price")
+        try:
+            price = float(raw_price) if raw_price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        if price is None:
+            missing.append(sym)
+            lines.append(f"{sym[:5]:<5} {'—':>10} {'—':>7}")
+            continue
+        chg_pct: Optional[float]
+        try:
+            raw_chg = info.get("change_pct")
+            chg_pct = float(raw_chg) if raw_chg is not None and raw_chg != "" else None
+        except (TypeError, ValueError):
+            chg_pct = None
+        if chg_pct is None:
+            prev = info.get("prev_close")
+            if prev not in (None, ""):
+                try:
+                    chg_pct = (price - float(prev)) / float(prev) * 100
+                except (TypeError, ValueError, ZeroDivisionError):
+                    chg_pct = None
+        chg_str = _pct(chg_pct) if chg_pct is not None else "—"
+        lines.append(f"{sym[:5]:<5} {_fmt_quote_price(price):>10} {chg_str:>7}")
+
+    lines.append("```")
+    if missing:
+        lines.append(f"⚠️ no data: {', '.join(missing)}")
+    return "\n".join(lines)
+
+
 def mcp_url_from_env() -> str:
     return os.environ.get("IBKR_MCP_URL", MCP_DEFAULT_URL)
