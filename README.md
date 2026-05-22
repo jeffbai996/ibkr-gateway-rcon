@@ -43,15 +43,50 @@ systemctl --user enable --now ibkr-gateway-rcon-deadman.timer
 
 ## Commands
 
+**Control**
+
 ```
-/gateway status            → which gateways are up, which are paused (and until when)
-/gateway pause <name> [duration]
-/gateway resume <name>
-/gateway restart <name>
-/gateway tail [n=20]       → last N lines of the watchdog log
+/gateway status                       which gateways are up, which are paused
+/gateway pause [name] [duration]      defaults to all — duration is 30m/2h/1d/ISO or omit
+/gateway resume [name]                defaults to all
+/gateway restart [name]               defaults to all — async, non-blocking
+/gateway stop [name]                  defaults to all — only auto-pauses on success
+/gateway tail [n=20]                  last N lines of the watchdog log
+/gateway health                       process uptime, restart count, last heartbeat
 ```
 
-Duration accepts `30m`, `2h`, `1d`, or ISO timestamp. Omit for indefinite pause.
+**Read-only views (require MCP reachability)**
+
+```
+/gateway brief [scope]                portfolio summary: NLV, P&L, top positions, today's trades; CAD-only with FX
+/gateway pnl                          per-account daily / unrealized / realized
+/gateway positions                    top positions w/ cost basis, market value, unrealized P&L
+/gateway trades                       today's executions by account
+/gateway margin                       cushion, excess liquidity, buying power, leverage, utilization
+/gateway quote <symbols>              live quotes — space-separated tickers (e.g. mu avgo nvda)
+```
+
+Duration in `/gateway pause` accepts `30m`, `2h`, `1d`, or an ISO-8601 timestamp. Omit for indefinite. Most control commands accept `name` *or* an `all` sentinel — omitting `name` defaults to all gateways.
+
+Output is mobile-friendly: code-block formatted with consistent column widths, `+1` decimal precision on NLV / day / liq / bp.
+
+## Multi-channel gating
+
+The bot can be restricted to specific Discord channels via an allowlist (`ALLOWED_CHANNEL_IDS` in `.env`). Slash commands invoked anywhere else return a polite refusal without leaking what they would have done. Guild ID is auto-discovered on startup; you can pin a specific guild in `.env` if you have multiple.
+
+After guild sync the bot clears any duplicate global registrations so a single channel only sees one set of commands.
+
+## Restart semantics
+
+`/gateway restart` returns immediately and runs the restart asynchronously (`smart_restart_async`) so Discord doesn't time out on cold IBKR boots (which can run 60-240s). Progress is logged; `/gateway tail` shows the live stream.
+
+`/gateway stop` only auto-pauses the gateway when the stop actually succeeded — a failed stop doesn't silently flip the gateway to paused state.
+
+`/gateway status` reports MCP reachability honestly: if an MCP subscription is stale, the status row shows it stale rather than reporting last-known-good as current.
+
+## Quotes / data hygiene
+
+`/gateway quote` treats non-numeric price/change values as missing data rather than rendering them as `0` or `NaN`. Stale data in any view is labeled explicitly.
 
 ## Layout
 
@@ -70,13 +105,7 @@ ibkr-gateway-rcon/
 │   ├── ibkr-gateway-rcon-bot.service
 │   ├── ibkr-gateway-rcon-deadman.service
 │   └── ibkr-gateway-rcon-deadman.timer
-├── tests/
-│   ├── test_config.py
-│   ├── test_duration_parse.py
-│   ├── test_skip_files.py
-│   ├── test_status.py
-│   ├── test_watchdog_tick.py
-│   └── test_heartbeat.py
+├── tests/                  # unit + integration coverage on config, durations, skip files, status, watchdog tick, heartbeat
 └── docs/
     ├── install.md
     ├── cron.md
