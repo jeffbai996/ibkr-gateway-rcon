@@ -353,22 +353,19 @@ def _account_rows(positions: Optional[dict], acct_id: str) -> list[dict]:
     return rows
 
 
-def build_report(data: ReportData) -> str:
-    """Mobile-friendly detailed report, CAD, wrapped in a code block.
+def _report_lines(data: ReportData) -> list[str]:
+    """Build the report body as a list of content lines (no code fences).
 
     Per-account sections so every number is attributable: combined NLV +
     combined unrealized up top, then each account gets its own header, margin
     snapshot, positions (its own weights/prices), and concentration. Columns
-    align to a shared 30-col grid; every line ≤ 32 chars.
+    align to a shared 38-col grid.
 
     Unrealized is summed from the STABLE positions feed (per-currency → CAD),
     not the /api/account-pnl markdown which flickers on cold calls.
     """
-    if not data.healthy:
-        return "⚠️ report unavailable — ibkr mcp not responding."
-
     now = datetime.now(_PACIFIC).strftime("%a %d %b · %H:%M PT")
-    lines: list[str] = ["```", "📊 IBKR REPORT", now, ""]
+    lines: list[str] = ["📊 IBKR REPORT", now, ""]
 
     usdcad = data.fx_rates.get("USDCAD")
     if usdcad:
@@ -452,10 +449,12 @@ def build_report(data: ReportData) -> str:
                 price = r.get("market_price")
                 price_txt = f"${price:,.2f}" if price is not None else "—"
                 dp = data.day_pct.get(r["symbol"])
-                dtxt = f"{dp:+.2f}%" if dp is not None else ""
-                # line 1: SYM  weight  price  dayΔ%
-                right = f"{wtxt}  {price_txt}  {dtxt}".rstrip()
-                lines.append(f"  {label:<8}{right:>{CONTENT_W - 2 - 8}}")
+                dtxt = f"{dp:+.2f}%" if dp is not None else "—"
+                # line 1: fixed sub-columns so weight / price / dayΔ% align
+                # vertically across every row: label(8) wt(6) price(11) day(8).
+                lines.append(
+                    f"  {label:<8}{wtxt:>6}{price_txt:>11}{dtxt:>8}"
+                )
                 # line 2: shares @ avg cost
                 shares = r.get("shares")
                 avg = r.get("avg_cost")
@@ -497,5 +496,58 @@ def build_report(data: ReportData) -> str:
             lines.append(_kv(f"  {sym}", f"{ex[5:]} {amt} {fwd}"))
         lines.append("")
 
-    lines.append("```")
-    return "\n".join(lines)
+    # trailing blank is noise; drop it
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def build_report(data: ReportData) -> str:
+    """Full report as a single fenced code block (used by tests / short books)."""
+    if not data.healthy:
+        return "⚠️ report unavailable — ibkr mcp not responding."
+    return "```\n" + "\n".join(_report_lines(data)) + "\n```"
+
+
+def build_report_messages(data: ReportData, limit: int = 1900) -> list[str]:
+    """Split the report into Discord-sized messages, each its own code block.
+
+    Discord caps a message at 2000 chars. The detailed report runs ~2500, so
+    pack section blocks (blank-line-delimited groups) into chunks ≤ `limit`,
+    splitting only at section boundaries so no card is torn mid-row. Each chunk
+    is independently fenced so monospace alignment holds in every message.
+    """
+    if not data.healthy:
+        return ["⚠️ report unavailable — ibkr mcp not responding."]
+
+    lines = _report_lines(data)
+    # group into sections delimited by blank lines (keeps cards intact)
+    sections: list[list[str]] = []
+    cur: list[str] = []
+    for ln in lines:
+        if ln == "":
+            if cur:
+                sections.append(cur)
+                cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        sections.append(cur)
+
+    FENCE = 8  # len of the wrapping "```\n" + "\n```"
+    messages: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+    for sec in sections:
+        sec_text = "\n".join(sec)
+        # +1 for the blank line we re-insert between sections in a chunk
+        add = len(sec_text) + (1 if buf else 0)
+        if buf and buf_len + add + FENCE > limit:
+            messages.append("```\n" + "\n\n".join(buf) + "\n```")
+            buf, buf_len = [], 0
+            add = len(sec_text)
+        buf.append(sec_text)
+        buf_len += add
+    if buf:
+        messages.append("```\n" + "\n\n".join(buf) + "\n```")
+    return messages

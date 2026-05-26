@@ -503,12 +503,13 @@ def build_bot() -> discord.Client:
             return await _reject_channel(interaction)
         await interaction.response.defer(thinking=True)
         data = await rp.fetch_report_data(bf.mcp_url_from_env())
-        out = rp.build_report(data)
-        # Discord 2000-char cap. The report is longer than brief; if it ever
-        # overflows, truncate inside the code block and re-close the fence.
-        if len(out) > 1950:
-            out = out[:1940] + "\n…\n```"
-        await interaction.followup.send(out)
+        # The detailed report exceeds Discord's 2000-char cap, so it's split
+        # into section-aligned chunks — send each as its own message (first via
+        # the interaction followup, the rest to the channel).
+        messages = rp.build_report_messages(data)
+        await interaction.followup.send(messages[0])
+        for extra in messages[1:]:
+            await interaction.channel.send(extra)
 
     @group.command(name="pnl", description="Per-account P&L breakdown — daily, unrealized, realized")
     @app_commands.describe(account="Account ID (e.g. U12345678). Omit for all.")
