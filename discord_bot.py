@@ -45,6 +45,7 @@ from dotenv import load_dotenv
 
 import gateway_ctl as gc
 import brief as bf
+import report as rp
 
 
 log = logging.getLogger("gateway_bot")
@@ -494,6 +495,19 @@ def build_bot() -> discord.Client:
         # Discord 2000-char cap.
         if len(out) > 1950:
             out = out[:1950] + "…"
+        await interaction.followup.send(out)
+
+    @group.command(name="report", description="Detailed portfolio report: full numbers, margin, positions, concentration, stress")
+    async def report_cmd(interaction: discord.Interaction):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        data = await rp.fetch_report_data(bf.mcp_url_from_env())
+        out = rp.build_report(data)
+        # Discord 2000-char cap. The report is longer than brief; if it ever
+        # overflows, truncate inside the code block and re-close the fence.
+        if len(out) > 1950:
+            out = out[:1940] + "\n…\n```"
         await interaction.followup.send(out)
 
     @group.command(name="pnl", description="Per-account P&L breakdown — daily, unrealized, realized")
