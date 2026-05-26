@@ -498,15 +498,8 @@ def _report_lines(data: ReportData) -> list[str]:
     for acct in accounts:
         lines.extend(_account_card(data, acct))
 
-    # ---- Stress (whole-book preflight) ----
-    s = _parse_stress(data.stress_md)
-    if s and (s.get("buffer") is not None or s.get("verdict")):
-        lines.append(f"⚠️ STRESS −{STRESS_DRAWDOWN_PCT:.0f}% (primary)")
-        if s.get("verdict"):
-            lines.append(f"  {s['verdict'][:CONTENT_W - 2]}")
-        if s.get("buffer") is not None:
-            lines.append(_kv("  buffer", _money_full(s["buffer"])))
-        lines.append("")
+    # ---- Whole-book liquidation distance (exact, from maint margin) ----
+    lines.extend(_liquidation_distance(data, accounts))
 
     # ---- Dividend calendar ----
     divs = _dividend_rows(data.dividends_md)
@@ -520,6 +513,39 @@ def _report_lines(data: ReportData) -> list[str]:
     while lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _liquidation_distance(data: "ReportData", accounts: list[dict]) -> list[str]:
+    """Whole-book risk line built from EXACT margin distances, not an estimate.
+
+    Replaces the old preflight "stress" buffer (which mis-modeled the shock:
+    it applied a flat drawdown to uncorrelated ballast like GLD and stacked a
+    vol-adjustment on the proportional margin scale, inflating the number).
+
+    `dd→liq` (maint_drawdown_pct) comes straight from IBKR's own maintenance
+    margin — it's the precise % the book can fall before forced liquidation.
+    We surface the TIGHTEST account's distance as the headline whole-book risk,
+    since that account liquidates first.
+    """
+    dists: list[tuple[str, float]] = []
+    for acct in accounts:
+        acct_id = acct.get("account", "?")
+        m = _parse_margin(data.margin_by_account.get(acct_id))
+        ddl = m.get("maint_drawdown_pct")
+        if ddl is not None:
+            dists.append((acct_id, ddl))
+    if not dists:
+        return []
+    acct_id, tightest = min(dists, key=lambda t: t[1])
+    out = ["🛡️ LIQUIDATION DISTANCE"]
+    # "first forced liquidation at −X%" — the real, exact stress answer.
+    tag = "ok" if tightest >= 15 else "tight" if tightest >= 8 else "CRIT"
+    label = f"  −{tightest:.2f}% ({tag})"
+    if len(dists) > 1:
+        label += f"  ← {acct_id}"   # which account hits first
+    out.append(label)
+    out.append("")
+    return out
 
 
 def build_report(data: ReportData) -> str:
@@ -572,14 +598,7 @@ def build_report_messages(data: ReportData, which: Optional[str] = None) -> list
 
     # Trailing block — stress + dividends (whole-book context).
     trailer: list[str] = []
-    s = _parse_stress(data.stress_md)
-    if s and (s.get("buffer") is not None or s.get("verdict")):
-        trailer.append(f"⚠️ STRESS −{STRESS_DRAWDOWN_PCT:.0f}% (primary)")
-        if s.get("verdict"):
-            trailer.append(f"  {s['verdict'][:CONTENT_W - 2]}")
-        if s.get("buffer") is not None:
-            trailer.append(_kv("  buffer", _money_full(s["buffer"])))
-        trailer.append("")
+    trailer.extend(_liquidation_distance(data, accts))
     divs = _dividend_rows(data.dividends_md)
     if divs:
         trailer.append("💵 DIVIDENDS (ex · /sh · 12M)")

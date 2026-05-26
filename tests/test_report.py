@@ -149,7 +149,7 @@ def test_report_has_all_built_sections():
     assert "U1234567" in out           # per-account section header
     assert "AAPL" in out               # positions
     assert "HHI" in out.upper()        # concentration
-    assert "STRESS" in out.upper()     # stress
+    assert "LIQUIDATION DISTANCE" in out.upper()  # whole-book risk (replaced bogus stress)
 
 
 def test_report_positions_show_weight_and_full_value():
