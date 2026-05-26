@@ -353,6 +353,116 @@ def _account_rows(positions: Optional[dict], acct_id: str) -> list[dict]:
     return rows
 
 
+def _account_card(data: ReportData, acct: dict) -> list[str]:
+    """One account's full card: header, balances, margin, positions, conc."""
+    lines: list[str] = []
+    acct_id = acct.get("account", "?")
+    stale = _account_stale(data.pnl_by_account.get(acct_id, ""))
+    lines.append((f"━ {acct_id}" + (" ⚠️STALE" if stale else ""))[:CONTENT_W])
+
+    if acct.get("error") or acct.get("nlv") is None:
+        lines.append(f"  ⚠️ {acct.get('error', 'no data')}"[:CONTENT_W])
+        lines.append("")
+        return lines
+
+    cushion = acct.get("cushion_pct", 0)
+    pnl_tuple = bf._extract_daily_pnl(data.pnl_by_account.get(acct_id, ""))
+    acct_rows = _account_rows(data.positions, acct_id)
+    acct_unreal = _unrealized_cad(acct_rows, data.fx_rates) if acct_rows else None
+
+    lines.append(_kv("  nlv", _money_full(acct.get("nlv", 0))))
+    if pnl_tuple:
+        d, p = pnl_tuple
+        lines.append(_kv("  day", f"{_money_full(d)} {bf._pct(p)}"))
+    if acct_unreal is not None:
+        lines.append(_kv("  uPnl", _money_full(acct_unreal)))
+    lines.append(_kv("  cash", _money_full(acct.get("cash", 0))))
+    lines.append(_kv("  bp", _money_full(acct.get("buying_power", 0))))
+    lines.append(_kv("  gpv", _money_full(acct.get("gpv", 0))))
+    lines.append(_kv("  lev", f"{acct.get('leverage', 0):.2f}x"))
+    lines.append(_kv("  util", f"{acct.get('margin_util_pct', 0):.0f}%"))
+    lines.append("")
+
+    # margin block (per-account /api/margin)
+    m = _parse_margin(data.margin_by_account.get(acct_id))
+    init_m = acct.get("init_margin")
+    maint_m = acct.get("maint_margin")
+    if any(v is not None for v in (init_m, maint_m, *m.values())):
+        lines.append("  ⚖️ margin")
+        if init_m is not None:
+            lines.append(_kv("    init req", _money_full(init_m)))
+        if maint_m is not None:
+            lines.append(_kv("    maint req", _money_full(maint_m)))
+        if m.get("excess_maint") is not None:
+            lines.append(_kv("    excess", _money_full(m["excess_maint"])))
+        tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
+        lines.append(_kv("    cushion", f"{cushion:.1f}% ({tag})"))
+        if m.get("maint_drawdown_pct") is not None:
+            lines.append(_kv("    dd→liq", f"{m['maint_drawdown_pct']:.2f}%"))
+        if m.get("init_drawdown_pct") is not None:
+            lines.append(_kv("    dd→bp", f"{m['init_drawdown_pct']:.2f}%"))
+        lines.append("")
+
+    # positions for THIS account — price/value from the row itself (the row
+    # carries the correct price for its OWN listing, incl. CDRs like AVGO(C)
+    # which trade at a fraction of the US parent). Day % from /api/prices (a
+    # ratio, listing-agnostic).
+    if acct_rows:
+        lines.append("  📈 positions")
+        for r in acct_rows:
+            ccy = r.get("currency", "USD")
+            sym = r["symbol"] + ("(C)" if ccy != "USD" else "")
+            label = sym[:8]
+            w = r.get("weight_pct")
+            wtxt = f"{w:.1f}%" if w is not None else "-"
+            price = r.get("market_price")
+            price_txt = f"${price:,.2f}" if price is not None else "—"
+            dp = data.day_pct.get(r["symbol"])
+            dtxt = f"{dp:+.2f}%" if dp is not None else "—"
+            # fixed sub-columns so weight / price / dayΔ% align vertically:
+            # label(8) wt(6) price(11) day(8).
+            lines.append(f"  {label:<8}{wtxt:>6}{price_txt:>11}{dtxt:>8}")
+            shares = r.get("shares")
+            avg = r.get("avg_cost")
+            if shares is not None and avg is not None:
+                lines.append(_kv("    qty@avg", f"{int(shares):,} @ ${avg:,.2f}"))
+            mv_cad = bf._fx_to_cad(float(r.get("market_value", 0) or 0), ccy, data.fx_rates)
+            up_native = float(r.get("unrealized_pnl", 0) or 0)
+            up_cad = bf._fx_to_cad(up_native, ccy, data.fx_rates)
+            cost = float(shares or 0) * float(avg or 0)
+            up_pct = (up_native / cost * 100) if cost else 0.0
+            lines.append(_kv("    mkt val", _money_full(mv_cad)))
+            lines.append(_kv("    unreal", f"{_money_full(up_cad)} {up_pct:+.1f}%"))
+        lines.append("")
+
+        wl = [r["weight_pct"] for r in acct_rows if r.get("weight_pct") is not None]
+        if wl:
+            lines.append(_kv("  top-3", f"{_top_n_weight(wl, 3):.1f}%"))
+            lines.append(_kv("  HHI", f"{_hhi(wl):.3f}"))
+            lines.append("")
+
+    return lines
+
+
+def _resolve_accounts(data: ReportData, which: Optional[str]) -> list[dict]:
+    """Map a 'primary'/'secondary'/'both'/None selector to account dicts.
+
+    Accounts are ordered as the MCP returns them: index 0 = primary, 1 =
+    secondary, matching the gateway naming. None/'both'/'all' → every account.
+    """
+    accts = (data.summary or {}).get("accounts", [])
+    w = (which or "").strip().lower()
+    if w in ("", "both", "all"):
+        return accts
+    if w in ("primary", "p", "1") and accts:
+        return accts[:1]
+    if w in ("secondary", "s", "2") and len(accts) >= 2:
+        return accts[1:2]
+    # also accept a literal account id
+    by_id = [a for a in accts if a.get("account") == which]
+    return by_id or accts
+
+
 def _report_lines(data: ReportData) -> list[str]:
     """Build the report body as a list of content lines (no code fences).
 
@@ -386,97 +496,7 @@ def _report_lines(data: ReportData) -> list[str]:
 
     # ---- Per-account sections ----
     for acct in accounts:
-        acct_id = acct.get("account", "?")
-        stale = _account_stale(data.pnl_by_account.get(acct_id, ""))
-        head = f"━ {acct_id}" + (" ⚠️STALE" if stale else "")
-        lines.append(head[:CONTENT_W])
-
-        if acct.get("error") or acct.get("nlv") is None:
-            lines.append(f"  ⚠️ {acct.get('error', 'no data')}"[:CONTENT_W])
-            lines.append("")
-            continue
-
-        cushion = acct.get("cushion_pct", 0)
-        pnl_tuple = bf._extract_daily_pnl(data.pnl_by_account.get(acct_id, ""))
-        acct_rows = _account_rows(data.positions, acct_id)
-        acct_unreal = _unrealized_cad(acct_rows, data.fx_rates) if acct_rows else None
-
-        lines.append(_kv("  nlv", _money_full(acct.get("nlv", 0))))
-        if pnl_tuple:
-            d, p = pnl_tuple
-            lines.append(_kv("  day", f"{_money_full(d)} {bf._pct(p)}"))
-        if acct_unreal is not None:
-            lines.append(_kv("  uPnl", _money_full(acct_unreal)))
-        lines.append(_kv("  cash", _money_full(acct.get("cash", 0))))
-        lines.append(_kv("  bp", _money_full(acct.get("buying_power", 0))))
-        lines.append(_kv("  gpv", _money_full(acct.get("gpv", 0))))
-        lines.append(_kv("  lev", f"{acct.get('leverage', 0):.2f}x"))
-        lines.append(_kv("  util", f"{acct.get('margin_util_pct', 0):.0f}%"))
-        lines.append("")
-
-        # ---- margin block (per-account /api/margin) ----
-        m = _parse_margin(data.margin_by_account.get(acct_id))
-        init_m = acct.get("init_margin")
-        maint_m = acct.get("maint_margin")
-        if any(v is not None for v in (init_m, maint_m, *m.values())):
-            lines.append("  ⚖️ margin")
-            if init_m is not None:
-                lines.append(_kv("    init req", _money_full(init_m)))
-            if maint_m is not None:
-                lines.append(_kv("    maint req", _money_full(maint_m)))
-            if m.get("excess_maint") is not None:
-                lines.append(_kv("    excess", _money_full(m["excess_maint"])))
-            tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
-            lines.append(_kv("    cushion", f"{cushion:.1f}% ({tag})"))
-            if m.get("maint_drawdown_pct") is not None:
-                lines.append(_kv("    dd→liq", f"{m['maint_drawdown_pct']:.2f}%"))
-            if m.get("init_drawdown_pct") is not None:
-                lines.append(_kv("    dd→bp", f"{m['init_drawdown_pct']:.2f}%"))
-            lines.append("")
-
-        # ---- positions for THIS account ----
-        # Price/value from the row itself — the row carries the correct price
-        # for its OWN listing (CDRs like AVGO(C) trade at a fraction of the US
-        # parent). Day % comes from /api/prices (a ratio, listing-agnostic).
-        if acct_rows:
-            lines.append("  📈 positions")
-            for r in acct_rows:
-                ccy = r.get("currency", "USD")
-                sym = r["symbol"] + ("(C)" if ccy != "USD" else "")
-                label = sym[:8]
-                w = r.get("weight_pct")
-                wtxt = f"{w:.1f}%" if w is not None else "-"
-                price = r.get("market_price")
-                price_txt = f"${price:,.2f}" if price is not None else "—"
-                dp = data.day_pct.get(r["symbol"])
-                dtxt = f"{dp:+.2f}%" if dp is not None else "—"
-                # line 1: fixed sub-columns so weight / price / dayΔ% align
-                # vertically across every row: label(8) wt(6) price(11) day(8).
-                lines.append(
-                    f"  {label:<8}{wtxt:>6}{price_txt:>11}{dtxt:>8}"
-                )
-                # line 2: shares @ avg cost
-                shares = r.get("shares")
-                avg = r.get("avg_cost")
-                if shares is not None and avg is not None:
-                    lines.append(_kv("    qty@avg", f"{int(shares):,} @ ${avg:,.2f}"))
-                # line 3: mkt value + unrealized $ + unrealized %
-                mv_cad = bf._fx_to_cad(float(r.get("market_value", 0) or 0), ccy, data.fx_rates)
-                up_native = float(r.get("unrealized_pnl", 0) or 0)
-                up_cad = bf._fx_to_cad(up_native, ccy, data.fx_rates)
-                # unrealized % vs cost basis (native ratio — currency cancels)
-                cost = float(shares or 0) * float(avg or 0)
-                up_pct = (up_native / cost * 100) if cost else 0.0
-                lines.append(_kv("    mkt val", _money_full(mv_cad)))
-                lines.append(_kv("    unreal", f"{_money_full(up_cad)} {up_pct:+.1f}%"))
-            lines.append("")
-
-            # concentration — within this account, weights sum to ~100
-            wl = [r["weight_pct"] for r in acct_rows if r.get("weight_pct") is not None]
-            if wl:
-                lines.append(_kv("  top-3", f"{_top_n_weight(wl, 3):.1f}%"))
-                lines.append(_kv("  HHI", f"{_hhi(wl):.3f}"))
-                lines.append("")
+        lines.extend(_account_card(data, acct))
 
     # ---- Stress (whole-book preflight) ----
     s = _parse_stress(data.stress_md)
@@ -509,45 +529,70 @@ def build_report(data: ReportData) -> str:
     return "```\n" + "\n".join(_report_lines(data)) + "\n```"
 
 
-def build_report_messages(data: ReportData, limit: int = 1900) -> list[str]:
-    """Split the report into Discord-sized messages, each its own code block.
+def _fence(lines: list[str]) -> str:
+    """Wrap content lines in a code block, trimming trailing blanks."""
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "```\n" + "\n".join(lines) + "\n```"
 
-    Discord caps a message at 2000 chars. The detailed report runs ~2500, so
-    pack section blocks (blank-line-delimited groups) into chunks ≤ `limit`,
-    splitting only at section boundaries so no card is torn mid-row. Each chunk
-    is independently fenced so monospace alignment holds in every message.
+
+def build_report_messages(data: ReportData, which: Optional[str] = None) -> list[str]:
+    """One Discord message per account card, selected by `which`.
+
+    `which`: 'primary' / 'secondary' / a U-account id → that one account's
+    card. None / 'both' / 'all' → one message per account (so each fits under
+    Discord's 2000-char cap and is independently aligned).
+
+    The combined header (NLV + combined unrealized + FX) rides on the first
+    message; the whole-book stress + dividend calendar ride on the last.
     """
     if not data.healthy:
         return ["⚠️ report unavailable — ibkr mcp not responding."]
 
-    lines = _report_lines(data)
-    # group into sections delimited by blank lines (keeps cards intact)
-    sections: list[list[str]] = []
-    cur: list[str] = []
-    for ln in lines:
-        if ln == "":
-            if cur:
-                sections.append(cur)
-                cur = []
-        else:
-            cur.append(ln)
-    if cur:
-        sections.append(cur)
+    accts = _resolve_accounts(data, which)
+    if not accts:
+        return ["⚠️ no matching account."]
 
-    FENCE = 8  # len of the wrapping "```\n" + "\n```"
+    now = datetime.now(_PACIFIC).strftime("%a %d %b · %H:%M PT")
+    usdcad = data.fx_rates.get("USDCAD")
+
+    # Header block — only show combined totals when rendering the full book.
+    header: list[str] = ["📊 IBKR REPORT", now, ""]
+    if usdcad:
+        header.append(f"CAD · USDCAD {usdcad:.4f}")
+    showing_all = which is None or which.strip().lower() in ("", "both", "all")
+    if showing_all:
+        summary = data.summary or {}
+        combined = summary.get("combined_nlv")
+        all_rows = (data.positions or {}).get("positions", [])
+        if combined is not None:
+            header.append(_kv("NLV", _money_full(combined)))
+        if all_rows:
+            header.append(_kv("uPnl", _money_full(_unrealized_cad(all_rows, data.fx_rates))))
+
+    # Trailing block — stress + dividends (whole-book context).
+    trailer: list[str] = []
+    s = _parse_stress(data.stress_md)
+    if s and (s.get("buffer") is not None or s.get("verdict")):
+        trailer.append(f"⚠️ STRESS −{STRESS_DRAWDOWN_PCT:.0f}% (primary)")
+        if s.get("verdict"):
+            trailer.append(f"  {s['verdict'][:CONTENT_W - 2]}")
+        if s.get("buffer") is not None:
+            trailer.append(_kv("  buffer", _money_full(s["buffer"])))
+        trailer.append("")
+    divs = _dividend_rows(data.dividends_md)
+    if divs:
+        trailer.append("💵 DIVIDENDS (ex · /sh · 12M)")
+        for sym, ex, amt, fwd in divs:
+            trailer.append(_kv(f"  {sym}", f"{ex[5:]} {amt} {fwd}"))
+
     messages: list[str] = []
-    buf: list[str] = []
-    buf_len = 0
-    for sec in sections:
-        sec_text = "\n".join(sec)
-        # +1 for the blank line we re-insert between sections in a chunk
-        add = len(sec_text) + (1 if buf else 0)
-        if buf and buf_len + add + FENCE > limit:
-            messages.append("```\n" + "\n\n".join(buf) + "\n```")
-            buf, buf_len = [], 0
-            add = len(sec_text)
-        buf.append(sec_text)
-        buf_len += add
-    if buf:
-        messages.append("```\n" + "\n\n".join(buf) + "\n```")
+    for i, acct in enumerate(accts):
+        block: list[str] = []
+        if i == 0:
+            block += header + [""]
+        block += _account_card(data, acct)
+        if i == len(accts) - 1 and trailer:
+            block += [""] + trailer
+        messages.append(_fence(block))
     return messages

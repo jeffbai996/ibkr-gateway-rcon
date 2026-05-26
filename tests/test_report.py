@@ -357,3 +357,65 @@ def test_report_still_mobile_width_with_extras():
     out = rp.build_report(_data())
     for line in out.split("\n"):
         assert len(line) <= 38, f"line too wide ({len(line)}): {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Per-account message selection
+# ---------------------------------------------------------------------------
+
+def _two_account_data():
+    summ = _summary()
+    summ["combined_nlv"] = 1414300.0
+    summ["accounts"].append({
+        "account": "U7654321", "currency": "CAD", "nlv": 130000.0,
+        "gpv": 130000.0, "cash": 0.0, "buying_power": 50000.0,
+        "init_margin": 0.0, "maint_margin": 0.0, "excess_liquidity": 50000.0,
+        "full_excess_liquidity": 50000.0, "cushion_pct": 40.0,
+        "leverage": 1.0, "margin_util_pct": 0.0,
+    })
+    pos = _positions()
+    pos["positions"].append(
+        {"symbol": "AAPL", "sec_type": "STK", "shares": 300, "avg_cost": 180.0,
+         "market_price": 260.0, "market_value": 78000.0, "unrealized_pnl": 24000.0,
+         "currency": "USD", "weight_pct": 60.0, "account": "U7654321"})
+    return _data(summary=summ, positions=pos, fx_rates={"USDCAD": 1.0},
+                 pnl_by_account={"U1234567": _PNL_MD, "U7654321": _PNL_MD})
+
+
+def test_messages_both_emits_one_per_account():
+    msgs = rp.build_report_messages(_two_account_data(), which="both")
+    assert len(msgs) == 2
+    assert "U1234567" in msgs[0]
+    assert "U7654321" in msgs[1]
+    # combined totals only on the first message
+    assert "NLV" in msgs[0] and "NLV" not in msgs[1]
+
+
+def test_messages_primary_only():
+    msgs = rp.build_report_messages(_two_account_data(), which="primary")
+    assert len(msgs) == 1
+    assert "U1234567" in msgs[0]
+    assert "U7654321" not in msgs[0]
+
+
+def test_messages_secondary_only():
+    msgs = rp.build_report_messages(_two_account_data(), which="secondary")
+    assert len(msgs) == 1
+    assert "U7654321" in msgs[0]
+    assert "U1234567" not in msgs[0]
+
+
+def test_messages_each_under_discord_cap():
+    for which in ("both", "primary", "secondary"):
+        for m in rp.build_report_messages(_two_account_data(), which=which):
+            assert len(m) <= 2000, f"{which} message over cap: {len(m)}"
+
+
+def test_messages_default_is_both():
+    assert len(rp.build_report_messages(_two_account_data())) == 2
+
+
+def test_messages_each_line_within_width():
+    for m in rp.build_report_messages(_two_account_data(), which="both"):
+        for line in m.split("\n"):
+            assert len(line) <= 40, f"line too wide ({len(line)}): {line!r}"

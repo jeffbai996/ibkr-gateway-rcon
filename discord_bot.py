@@ -498,15 +498,24 @@ def build_bot() -> discord.Client:
         await interaction.followup.send(out)
 
     @group.command(name="report", description="Detailed portfolio report: full numbers, margin, positions, concentration, stress")
-    async def report_cmd(interaction: discord.Interaction):
+    @app_commands.describe(account="Which account — primary, secondary, or both (default both)")
+    @app_commands.choices(account=[
+        app_commands.Choice(name="both (default)", value="both"),
+        app_commands.Choice(name="primary", value="primary"),
+        app_commands.Choice(name="secondary", value="secondary"),
+    ])
+    async def report_cmd(
+        interaction: discord.Interaction,
+        account: Optional[app_commands.Choice[str]] = None,
+    ):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
         await interaction.response.defer(thinking=True)
+        which = account.value if account else "both"
         data = await rp.fetch_report_data(bf.mcp_url_from_env())
-        # The detailed report exceeds Discord's 2000-char cap, so it's split
-        # into section-aligned chunks — send each as its own message (first via
-        # the interaction followup, the rest to the channel).
-        messages = rp.build_report_messages(data)
+        # One message per account card (each fits under Discord's 2000-char
+        # cap); first via the interaction followup, the rest to the channel.
+        messages = rp.build_report_messages(data, which=which)
         await interaction.followup.send(messages[0])
         for extra in messages[1:]:
             await interaction.channel.send(extra)
