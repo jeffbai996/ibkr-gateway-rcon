@@ -108,15 +108,17 @@ _DIVIDENDS_MD = (
 
 def _data(healthy=True, summary=None, positions=None,
           margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None,
-          pnl_by_account=None, dividends_md=_DIVIDENDS_MD):
+          pnl_by_account=None, dividends_md=_DIVIDENDS_MD, day_pct=None):
     return rp.ReportData(
         summary=summary if summary is not None else _summary(),
         positions=positions if positions is not None else _positions(),
-        margin_md=margin_md,
+        margin_by_account={"U1234567": margin_md} if margin_md else {},
         stress_md=stress_md,
         dividends_md=dividends_md,
         fx_rates=fx_rates if fx_rates is not None else {"USDCAD": 1.37},
         healthy=healthy,
+        day_pct=day_pct if day_pct is not None
+        else {"AAPL": 1.20, "MSFT": -0.33, "GOOGL": 2.13, "SGOV": 0.0},
         pnl_by_account=pnl_by_account if pnl_by_account is not None
         else {"U1234567": _PNL_MD},
         fetch_errors=[],
@@ -246,7 +248,7 @@ def test_report_per_account_no_cross_account_weight_blowup():
 def test_report_mobile_width():
     out = rp.build_report(_data())
     for line in out.split("\n"):
-        assert len(line) <= 32, f"line too wide ({len(line)}): {line!r}"
+        assert len(line) <= 38, f"line too wide ({len(line)}): {line!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -335,19 +337,23 @@ def test_combined_unrealized_uses_positions_feed():
     assert "115,900" in out
 
 
-def test_next_dividend_picks_earliest():
-    # AAPL ex 06-04 is earlier than MSFT 07-13 → AAPL surfaces.
-    assert rp._next_dividend(_DIVIDENDS_MD).startswith("AAPL 06-04")
+def test_dividend_rows_sorted_by_ex_date():
+    rows = rp._dividend_rows(_DIVIDENDS_MD)
+    # AAPL ex 06-04 is earlier than MSFT 07-13 → AAPL first.
+    assert rows[0][0] == "AAPL"
+    assert rows[0][1] == "2026-06-04"
+    assert rows[1][0] == "MSFT"
 
 
-def test_report_shows_next_dividend():
+def test_report_shows_dividend_calendar():
     out = rp.build_report(_data())
-    assert "next div" in out
+    assert "DIVIDENDS" in out
     assert "AAPL" in out
+    assert "MSFT" in out
 
 
 def test_report_still_mobile_width_with_extras():
     # The new bottom blocks + spacing must not break the 32-char rule.
     out = rp.build_report(_data())
     for line in out.split("\n"):
-        assert len(line) <= 32, f"line too wide ({len(line)}): {line!r}"
+        assert len(line) <= 38, f"line too wide ({len(line)}): {line!r}"

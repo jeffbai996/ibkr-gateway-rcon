@@ -46,11 +46,12 @@ _PACIFIC = ZoneInfo("America/Los_Angeles")
 class ReportData:
     summary: Optional[dict]
     positions: Optional[dict]
-    margin_md: Optional[str]        # /api/margin markdown (may be None on fail)
     stress_md: Optional[str]        # /api/stress markdown (may be None on fail)
     fx_rates: dict[str, float]
     healthy: bool
+    margin_by_account: dict[str, str] = field(default_factory=dict)  # acct -> /api/margin md
     dividends_md: Optional[str] = None  # /api/dividends markdown
+    day_pct: dict[str, float] = field(default_factory=dict)  # symbol -> day change %
     fetch_errors: list[str] = field(default_factory=list)
     pnl_by_account: dict[str, str] = field(default_factory=dict)
 
@@ -74,10 +75,6 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
 
         summary_task = bf._fetch_json(session, f"{mcp_url}/api/summary")
         fx_task = bf._fetch_json(session, f"{mcp_url}/api/prices?symbols=USDCAD=X")
-        margin_task = bf._fetch_json(
-            session,
-            f"{mcp_url}/api/margin" + (f"?account={primary}" if primary else ""),
-        )
         stress_task = bf._fetch_json(
             session, f"{mcp_url}/api/stress?drawdown_pct={STRESS_DRAWDOWN_PCT}"
         )
@@ -93,13 +90,20 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             acct: bf._fetch_json(session, f"{mcp_url}/api/account-pnl?account={acct}")
             for acct in accounts
         }
-
-        (summary, fx_json, margin_json, stress_json, div_json) = await asyncio.gather(
-            summary_task, fx_task, margin_task, stress_task, dividends_task
+        # Per-account margin so each section gets its own buffer/distances
+        # (the old single primary-only fetch left the second account blank).
+        margin_tasks = {
+            acct: bf._fetch_json(session, f"{mcp_url}/api/margin?account={acct}")
+            for acct in accounts
+        }
+        (summary, fx_json, stress_json, div_json) = await asyncio.gather(
+            summary_task, fx_task, stress_task, dividends_task
         )
         pos_results = dict(zip(pos_tasks.keys(), await asyncio.gather(*pos_tasks.values())))
         pnl_results = dict(zip(pnl_tasks.keys(), await asyncio.gather(*pnl_tasks.values())))
+        margin_results = dict(zip(margin_tasks.keys(), await asyncio.gather(*margin_tasks.values())))
         pnl_md = {a: (r or {}).get("markdown", "") for a, r in pnl_results.items()}
+        margin_md_by_acct = {a: (r or {}).get("markdown", "") for a, r in margin_results.items()}
 
         # Concatenate every account's positions into one dict shaped like the
         # single-account response, so downstream code (and brief helpers) are
@@ -118,17 +122,32 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             if "price" in usdcad:
                 fx_rates["USDCAD"] = float(usdcad["price"])
 
+        # Day-change per held symbol. change_pct is a ratio (listing-agnostic),
+        # so joining by bare symbol is safe — the CDR price trap only affected
+        # absolute price, which we never take from here.
+        day_pct: dict[str, float] = {}
+        symbols = sorted({r["symbol"] for r in all_rows})
+        if symbols:
+            pr = await bf._fetch_json(
+                session, f"{mcp_url}/api/prices?symbols={','.join(symbols)}"
+            )
+            if pr and isinstance(pr.get("prices"), dict):
+                for sym, q in pr["prices"].items():
+                    if isinstance(q, dict) and q.get("change_pct") is not None:
+                        day_pct[sym] = float(q["change_pct"])
+
         if summary is None:
             errors.append("summary fetch failed")
 
         return ReportData(
             summary=summary,
             positions=positions,
-            margin_md=(margin_json or {}).get("markdown") if margin_json else None,
+            margin_by_account=margin_md_by_acct,
             stress_md=(stress_json or {}).get("markdown") if stress_json else None,
             dividends_md=(div_json or {}).get("markdown") if div_json else None,
             fx_rates=fx_rates,
             healthy=True,
+            day_pct=day_pct,
             fetch_errors=errors,
             pnl_by_account=pnl_md,
         )
@@ -261,11 +280,15 @@ def _account_stale(md: Optional[str]) -> bool:
     return "CACHED DATA" in md or "Gateway is offline" in md
 
 
-def _next_dividend(md: Optional[str]) -> Optional[str]:
-    """First upcoming dividend line from the dividends table: 'SYM ex MM-DD'."""
+def _dividend_rows(md: Optional[str]) -> list[tuple[str, str, str, str]]:
+    """Parse the dividend calendar table into (symbol, ex_date, amount, next12m).
+
+    Table columns: Symbol | Next Ex-Date | Amount/Share | Past 12M | Next 12M.
+    Sorted by ex-date ascending (soonest first).
+    """
     if not md:
-        return None
-    best: Optional[tuple[str, str, str]] = None  # (date, sym, amount)
+        return []
+    out: list[tuple[str, str, str, str]] = []
     for line in md.splitlines():
         s = line.strip()
         if not s.startswith("|") or "Symbol" in s or "---" in s:
@@ -274,14 +297,12 @@ def _next_dividend(md: Optional[str]) -> Optional[str]:
         if len(cells) < 3:
             continue
         sym, ex_date, amt = cells[0], cells[1], cells[2]
+        nxt = cells[4] if len(cells) >= 5 else ""
         if not re.match(r"\d{4}-\d{2}-\d{2}", ex_date):
             continue
-        if best is None or ex_date < best[0]:
-            best = (ex_date, sym, amt)
-    if not best:
-        return None
-    date, sym, amt = best
-    return f"{sym} {date[5:]} {amt}"  # strip year for width
+        out.append((sym, ex_date, amt, nxt))
+    out.sort(key=lambda r: r[1])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -289,18 +310,25 @@ def _next_dividend(md: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 #
 # Everything aligns to ONE grid so columns line up across every section. The
-# content width is 30 chars (fits a 32-char mobile code block with margin).
-# `_kv` renders a left label padded to LABEL_W, then a value right-aligned to
-# the remaining width, so all values share a right edge.
+# content width is 38 chars — a mobile Discord code block wraps around ~40 on
+# a phone, so 38 uses the real estate without wrapping. `_kv` renders a left
+# label padded to LABEL_W, then a value right-aligned to the remaining width,
+# so all values share a right edge.
 
-CONTENT_W = 30
-LABEL_W = 8
+CONTENT_W = 38
+LABEL_W = 10
 
 
 def _kv(label: str, value: str) -> str:
-    """label left-padded to LABEL_W, value right-aligned to fill CONTENT_W."""
-    value_w = CONTENT_W - LABEL_W
-    return f"{label:<{LABEL_W}}{value:>{value_w}}"
+    """Label left, value right-aligned so the line is exactly CONTENT_W.
+
+    Pads the label to at least LABEL_W, but if the label is longer (e.g. an
+    indented sub-row like '    init req') the value column shrinks to keep the
+    total at CONTENT_W — never overflows the mobile width.
+    """
+    pad = max(LABEL_W, len(label))
+    value_w = max(CONTENT_W - pad, 1)
+    return f"{label:<{pad}}{value:>{value_w}}"
 
 
 def _arrow(n: float) -> str:
@@ -362,8 +390,6 @@ def build_report(data: ReportData) -> str:
     # ---- Per-account sections ----
     for acct in accounts:
         acct_id = acct.get("account", "?")
-        # short tag for the header (last 4 of the IB account id)
-        short = acct_id[-4:] if len(acct_id) >= 4 else acct_id
         stale = _account_stale(data.pnl_by_account.get(acct_id, ""))
         head = f"━ {acct_id}" + (" ⚠️STALE" if stale else "")
         lines.append(head[:CONTENT_W])
@@ -389,36 +415,61 @@ def build_report(data: ReportData) -> str:
         lines.append(_kv("  gpv", _money_full(acct.get("gpv", 0))))
         lines.append(_kv("  lev", f"{acct.get('leverage', 0):.2f}x"))
         lines.append(_kv("  util", f"{acct.get('margin_util_pct', 0):.0f}%"))
-        excess = acct.get("excess_liquidity")
-        if excess is not None:
-            lines.append(_kv("  exliq", _money_full(excess)))
-        tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
-        lines.append(_kv("  cush", f"{cushion:.1f}% ({tag})"))
         lines.append("")
 
-        # positions for THIS account — price/value from the row itself
-        # (the row carries the correct price for its OWN listing, incl. CDRs
-        # like AVGO(C) which trade at a fraction of the US parent — never join
-        # the US ticker quote by bare symbol, that was the price bug).
+        # ---- margin block (per-account /api/margin) ----
+        m = _parse_margin(data.margin_by_account.get(acct_id))
+        init_m = acct.get("init_margin")
+        maint_m = acct.get("maint_margin")
+        if any(v is not None for v in (init_m, maint_m, *m.values())):
+            lines.append("  ⚖️ margin")
+            if init_m is not None:
+                lines.append(_kv("    init req", _money_full(init_m)))
+            if maint_m is not None:
+                lines.append(_kv("    maint req", _money_full(maint_m)))
+            if m.get("excess_maint") is not None:
+                lines.append(_kv("    excess", _money_full(m["excess_maint"])))
+            tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
+            lines.append(_kv("    cushion", f"{cushion:.1f}% ({tag})"))
+            if m.get("maint_drawdown_pct") is not None:
+                lines.append(_kv("    dd→liq", f"{m['maint_drawdown_pct']:.2f}%"))
+            if m.get("init_drawdown_pct") is not None:
+                lines.append(_kv("    dd→bp", f"{m['init_drawdown_pct']:.2f}%"))
+            lines.append("")
+
+        # ---- positions for THIS account ----
+        # Price/value from the row itself — the row carries the correct price
+        # for its OWN listing (CDRs like AVGO(C) trade at a fraction of the US
+        # parent). Day % comes from /api/prices (a ratio, listing-agnostic).
         if acct_rows:
             lines.append("  📈 positions")
             for r in acct_rows:
                 ccy = r.get("currency", "USD")
                 sym = r["symbol"] + ("(C)" if ccy != "USD" else "")
-                label = sym[:8]   # 'AVGO(C)' = 7, NVDA(C) = 7; cap at 8
+                label = sym[:8]
                 w = r.get("weight_pct")
                 wtxt = f"{w:.1f}%" if w is not None else "-"
                 price = r.get("market_price")
                 price_txt = f"${price:,.2f}" if price is not None else "—"
-                right = f"{wtxt}  {price_txt}"
-                # 2-space indent + label, value right-aligned so the line is
-                # exactly CONTENT_W regardless of label/CDR length.
-                inner = f"{label:<8}{right:>{CONTENT_W - 2 - 8}}"
-                lines.append(f"  {inner}")
+                dp = data.day_pct.get(r["symbol"])
+                dtxt = f"{dp:+.2f}%" if dp is not None else ""
+                # line 1: SYM  weight  price  dayΔ%
+                right = f"{wtxt}  {price_txt}  {dtxt}".rstrip()
+                lines.append(f"  {label:<8}{right:>{CONTENT_W - 2 - 8}}")
+                # line 2: shares @ avg cost
+                shares = r.get("shares")
+                avg = r.get("avg_cost")
+                if shares is not None and avg is not None:
+                    lines.append(_kv("    qty@avg", f"{int(shares):,} @ ${avg:,.2f}"))
+                # line 3: mkt value + unrealized $ + unrealized %
                 mv_cad = bf._fx_to_cad(float(r.get("market_value", 0) or 0), ccy, data.fx_rates)
-                up_cad = bf._fx_to_cad(float(r.get("unrealized_pnl", 0) or 0), ccy, data.fx_rates)
-                lines.append(_kv("    mv", _money_full(mv_cad)))
-                lines.append(_kv("    uP", _money_full(up_cad)))
+                up_native = float(r.get("unrealized_pnl", 0) or 0)
+                up_cad = bf._fx_to_cad(up_native, ccy, data.fx_rates)
+                # unrealized % vs cost basis (native ratio — currency cancels)
+                cost = float(shares or 0) * float(avg or 0)
+                up_pct = (up_native / cost * 100) if cost else 0.0
+                lines.append(_kv("    mkt val", _money_full(mv_cad)))
+                lines.append(_kv("    unreal", f"{_money_full(up_cad)} {up_pct:+.1f}%"))
             lines.append("")
 
             # concentration — within this account, weights sum to ~100
@@ -438,10 +489,12 @@ def build_report(data: ReportData) -> str:
             lines.append(_kv("  buffer", _money_full(s["buffer"])))
         lines.append("")
 
-    # ---- Next dividend ----
-    nxt = _next_dividend(data.dividends_md)
-    if nxt:
-        lines.append(_kv("next div", nxt))
+    # ---- Dividend calendar ----
+    divs = _dividend_rows(data.dividends_md)
+    if divs:
+        lines.append("💵 DIVIDENDS (ex · /sh · 12M)")
+        for sym, ex, amt, fwd in divs:
+            lines.append(_kv(f"  {sym}", f"{ex[5:]} {amt} {fwd}"))
         lines.append("")
 
     lines.append("```")
