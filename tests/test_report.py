@@ -100,16 +100,36 @@ def _prices():
     }
 
 
+_PNL_MD = (
+    "# Account P&L: U1234567\n\n"
+    "**Daily P&L**: +$12,500.00 CAD (+0.97% of NLV)\n"
+    "**Unrealized P&L**: +$116,000.00 CAD\n"
+    "**Realized P&L**: +$4,200.00 CAD\n"
+)
+
+_DIVIDENDS_MD = (
+    "# Dividend Calendar: U1234567\n\n"
+    "| Symbol | Next Ex-Date | Amount/Share | Past 12M | Next 12M |\n"
+    "|--------|-------------|-------------|----------|----------|\n"
+    "| MSFT | 2026-07-13 | $0.75 | $2.90 | $3.10 |\n"
+    "| AAPL | 2026-06-04 | $0.25 | $0.96 | $1.04 |\n"
+)
+
+
 def _data(healthy=True, summary=None, positions=None,
-          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None, prices=None):
+          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None, prices=None,
+          pnl_by_account=None, dividends_md=_DIVIDENDS_MD):
     return rp.ReportData(
         summary=summary if summary is not None else _summary(),
         positions=positions if positions is not None else _positions(),
         margin_md=margin_md,
         stress_md=stress_md,
+        dividends_md=dividends_md,
         fx_rates=fx_rates if fx_rates is not None else {"USDCAD": 1.37},
         healthy=healthy,
         prices=prices if prices is not None else _prices(),
+        pnl_by_account=pnl_by_account if pnl_by_account is not None
+        else {"U1234567": _PNL_MD},
         fetch_errors=[],
     )
 
@@ -257,3 +277,56 @@ def test_report_missing_margin_md_degrades_gracefully():
     out = rp.build_report(_data(margin_md=None))
     assert "1,284,300" in out
     assert "AAPL" in out
+
+
+# ---------------------------------------------------------------------------
+# Bottom blocks: combined P&L + next dividend
+# ---------------------------------------------------------------------------
+
+def test_account_pnl_parse():
+    p = rp._parse_account_pnl(_PNL_MD)
+    assert p["unrealized"] == 116000.0
+    assert p["realized"] == 4200.0
+
+
+def test_sum_pnl_across_accounts():
+    pnl = {"A": _PNL_MD, "B": _PNL_MD}
+    assert rp._sum_pnl(pnl, "unrealized") == 232000.0  # 116k + 116k
+    assert rp._sum_pnl(pnl, "realized") == 8400.0
+    assert rp._sum_pnl({}, "unrealized") is None
+
+
+def test_report_shows_combined_pnl_block():
+    out = rp.build_report(_data())
+    assert "P&L" in out
+    assert "116,000" in out          # unrealized
+    assert "4,200" in out            # realized
+
+
+def test_next_dividend_picks_earliest():
+    # AAPL ex 06-04 is earlier than MSFT 07-13 → AAPL surfaces.
+    assert rp._next_dividend(_DIVIDENDS_MD).startswith("AAPL 06-04")
+
+
+def test_report_shows_next_dividend():
+    out = rp.build_report(_data())
+    assert "NEXT DIV" in out
+    assert "AAPL" in out
+
+
+def test_report_blank_line_between_positions():
+    # Each position card is followed by a blank line for readability.
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
+    lines = out.split("\n")
+    # find the uPnl lines (last line of each card); the line after each is blank
+    upnl_idx = [i for i, l in enumerate(lines) if l.startswith("  uPnl")]
+    assert len(upnl_idx) >= 2
+    for i in upnl_idx:
+        assert lines[i + 1] == "", f"no blank line after card at line {i}"
+
+
+def test_report_still_mobile_width_with_extras():
+    # The new bottom blocks + spacing must not break the 32-char rule.
+    out = rp.build_report(_data())
+    for line in out.split("\n"):
+        assert len(line) <= 32, f"line too wide ({len(line)}): {line!r}"

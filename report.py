@@ -50,6 +50,7 @@ class ReportData:
     stress_md: Optional[str]        # /api/stress markdown (may be None on fail)
     fx_rates: dict[str, float]
     healthy: bool
+    dividends_md: Optional[str] = None  # /api/dividends markdown
     prices: dict[str, dict] = field(default_factory=dict)  # symbol -> day-change
     fetch_errors: list[str] = field(default_factory=list)
     pnl_by_account: dict[str, str] = field(default_factory=dict)
@@ -81,6 +82,7 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
         stress_task = bf._fetch_json(
             session, f"{mcp_url}/api/stress?drawdown_pct={STRESS_DRAWDOWN_PCT}"
         )
+        dividends_task = bf._fetch_json(session, f"{mcp_url}/api/dividends")
         # /api/positions with no param only returns the PRIMARY account. Fetch
         # each account explicitly and concatenate, so a multi-account book shows
         # every holding (the primary-only default silently dropped the rest).
@@ -93,8 +95,8 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             for acct in accounts
         }
 
-        (summary, fx_json, margin_json, stress_json) = await asyncio.gather(
-            summary_task, fx_task, margin_task, stress_task
+        (summary, fx_json, margin_json, stress_json, div_json) = await asyncio.gather(
+            summary_task, fx_task, margin_task, stress_task, dividends_task
         )
         pos_results = dict(zip(pos_tasks.keys(), await asyncio.gather(*pos_tasks.values())))
         pnl_results = dict(zip(pnl_tasks.keys(), await asyncio.gather(*pnl_tasks.values())))
@@ -138,6 +140,7 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             prices=prices,
             margin_md=(margin_json or {}).get("markdown") if margin_json else None,
             stress_md=(stress_json or {}).get("markdown") if stress_json else None,
+            dividends_md=(div_json or {}).get("markdown") if div_json else None,
             fx_rates=fx_rates,
             healthy=True,
             fetch_errors=errors,
@@ -225,6 +228,55 @@ def _parse_stress(md: Optional[str]) -> dict:
         "buffer": _money_from(_grab(md, "Buffer")),
         "stressed_equity": _money_from(_grab(md, "Stressed Equity")),
     }
+
+
+def _parse_account_pnl(md: Optional[str]) -> dict:
+    """Pull unrealized + realized P&L from /api/account-pnl markdown.
+
+    The markdown carries '**Unrealized P&L**: +$X CAD' and '**Realized P&L**'
+    beyond the daily figure brief already parses.
+    """
+    if not md:
+        return {}
+    return {
+        "unrealized": _money_from(_grab(md, "Unrealized P&L")),
+        "realized": _money_from(_grab(md, "Realized P&L")),
+    }
+
+
+def _sum_pnl(pnl_by_account: dict[str, str], key: str) -> Optional[float]:
+    """Sum a parsed P&L field across every account. None if nothing parsed."""
+    total = 0.0
+    seen = False
+    for md in pnl_by_account.values():
+        v = _parse_account_pnl(md).get(key)
+        if v is not None:
+            total += v
+            seen = True
+    return total if seen else None
+
+
+def _next_dividend(md: Optional[str]) -> Optional[str]:
+    """First upcoming dividend line from the dividends table: 'SYM ex MM-DD'."""
+    if not md:
+        return None
+    best: Optional[tuple[str, str, str]] = None  # (date, sym, amount)
+    for line in md.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or "Symbol" in s or "---" in s:
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        sym, ex_date, amt = cells[0], cells[1], cells[2]
+        if not re.match(r"\d{4}-\d{2}-\d{2}", ex_date):
+            continue
+        if best is None or ex_date < best[0]:
+            best = (ex_date, sym, amt)
+    if not best:
+        return None
+    date, sym, amt = best
+    return f"{sym} {date[5:]} {amt}"  # strip year for width
 
 
 # ---------------------------------------------------------------------------
@@ -347,11 +399,10 @@ def build_report(data: ReportData) -> str:
                 else:
                     day = "n/a"
                 lines.append(_kv("  day", day))
-                # line 3: market value (CAD)
+                # line 3-4: market value (CAD), unrealized $ + %
                 lines.append(_kv("  mv", _money_full(r["market_value_cad"])))
-                # line 4: unrealized %
                 lines.append(_kv("  uPnl", bf._pct(r["unrealized_pct"])))
-            lines.append("")
+                lines.append("")  # blank line between position cards
 
             # §4 concentration — local, no endpoint
             wl = [w for w in weights.values() if w is not None]
@@ -369,6 +420,24 @@ def build_report(data: ReportData) -> str:
             lines.append(f"  {s['verdict'][:CONTENT_W - 2]}")
         if s.get("buffer") is not None:
             lines.append(_kv("  buffer", _money_full(s["buffer"])))
+        lines.append("")
+
+    # §6 P&L — combined unrealized + realized across all accounts
+    tot_unreal = _sum_pnl(data.pnl_by_account, "unrealized")
+    tot_real = _sum_pnl(data.pnl_by_account, "realized")
+    if tot_unreal is not None or tot_real is not None:
+        lines.append("💰 P&L (all acct)")
+        if tot_unreal is not None:
+            lines.append(_kv("  unreal", _money_full(tot_unreal)))
+        if tot_real is not None:
+            lines.append(_kv("  real", _money_full(tot_real)))
+        lines.append("")
+
+    # §7 income — next upcoming dividend
+    nxt = _next_dividend(data.dividends_md)
+    if nxt:
+        lines.append("💵 NEXT DIV")
+        lines.append(f"  {nxt}"[:CONTENT_W])
         lines.append("")
 
     lines.append("```")
