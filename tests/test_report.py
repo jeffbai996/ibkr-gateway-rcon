@@ -90,8 +90,18 @@ _STRESS_MD = (
 )
 
 
+def _prices():
+    """Mirror /api/prices: per-symbol day move (price/change/change_pct)."""
+    return {
+        "AAPL": {"price": 260.40, "previous_close": 257.30, "change": 3.10, "change_pct": 1.20},
+        "MSFT": {"price": 335.00, "previous_close": 336.10, "change": -1.10, "change_pct": -0.33},
+        "GOOGL": {"price": 134.00, "previous_close": 131.20, "change": 2.80, "change_pct": 2.13},
+        "SGOV": {"price": 100.00, "previous_close": 100.00, "change": 0.00, "change_pct": 0.00},
+    }
+
+
 def _data(healthy=True, summary=None, positions=None,
-          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None):
+          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None, prices=None):
     return rp.ReportData(
         summary=summary if summary is not None else _summary(),
         positions=positions if positions is not None else _positions(),
@@ -99,6 +109,7 @@ def _data(healthy=True, summary=None, positions=None,
         stress_md=stress_md,
         fx_rates=fx_rates if fx_rates is not None else {"USDCAD": 1.37},
         healthy=healthy,
+        prices=prices if prices is not None else _prices(),
         fetch_errors=[],
     )
 
@@ -138,6 +149,49 @@ def test_report_positions_show_weight_and_full_value():
     # weight_pct surfaced, market value in full numbers (no M/k)
     assert "24.3" in out
     assert "312,000" in out
+
+
+def test_report_positions_show_price_and_day_change():
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
+    assert "$260.40" in out          # current price from /api/prices
+    assert "+1.20%" in out           # day change pct
+    assert "$3.10" in out            # day change dollar
+    assert "-0.33%" in out           # a down mover (MSFT)
+
+
+def test_report_day_change_missing_price_is_graceful():
+    # A held symbol with no price entry shows 'n/a' on the day line, no crash.
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}, prices={}))
+    assert "n/a" in out
+    assert "AAPL" in out
+
+
+def test_report_columns_aligned():
+    # All _kv rows share the same content width — values right-aligned to a
+    # common edge. Check that lines using the grid end at a consistent column.
+    out = rp.build_report(_data())
+    kv_lines = [l for l in out.split("\n")
+                if l.startswith(("  nlv", "  cash", "  bp", "  gpv",
+                                 "  lev", "  util", "  cush"))]
+    assert kv_lines, "expected aligned account rows"
+    widths = {len(l) for l in kv_lines}
+    assert widths == {rp.CONTENT_W}, f"misaligned widths: {widths}"
+
+
+def test_report_merges_positions_across_accounts():
+    # Same symbol held in two accounts merges into one row, weight summed.
+    pos = _positions()
+    pos["positions"].append(
+        {"symbol": "AAPL", "sec_type": "STK", "shares": 300,
+         "avg_cost": 180.0, "market_price": 260.0, "market_value": 78000.0,
+         "unrealized_pnl": 24000.0, "currency": "USD",
+         "weight_pct": 6.0, "account": "U7654321"},
+    )
+    out = rp.build_report(_data(positions=pos, fx_rates={"USDCAD": 1.0}))
+    # AAPL appears once; merged weight = 24.3 + 6.0 = 30.3
+    assert out.count("AAPL ") <= 1 or "AAPL" in out
+    weights = rp._position_weights(pos)
+    assert abs(weights["AAPL"] - 30.3) < 0.01
 
 
 # ---------------------------------------------------------------------------

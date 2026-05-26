@@ -50,6 +50,7 @@ class ReportData:
     stress_md: Optional[str]        # /api/stress markdown (may be None on fail)
     fx_rates: dict[str, float]
     healthy: bool
+    prices: dict[str, dict] = field(default_factory=dict)  # symbol -> day-change
     fetch_errors: list[str] = field(default_factory=list)
     pnl_by_account: dict[str, str] = field(default_factory=dict)
 
@@ -72,7 +73,6 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
         primary = accounts[0] if accounts else None
 
         summary_task = bf._fetch_json(session, f"{mcp_url}/api/summary")
-        positions_task = bf._fetch_json(session, f"{mcp_url}/api/positions")
         fx_task = bf._fetch_json(session, f"{mcp_url}/api/prices?symbols=USDCAD=X")
         margin_task = bf._fetch_json(
             session,
@@ -81,16 +81,35 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
         stress_task = bf._fetch_json(
             session, f"{mcp_url}/api/stress?drawdown_pct={STRESS_DRAWDOWN_PCT}"
         )
+        # /api/positions with no param only returns the PRIMARY account. Fetch
+        # each account explicitly and concatenate, so a multi-account book shows
+        # every holding (the primary-only default silently dropped the rest).
+        pos_tasks = {
+            acct: bf._fetch_json(session, f"{mcp_url}/api/positions?account={acct}")
+            for acct in accounts
+        }
         pnl_tasks = {
             acct: bf._fetch_json(session, f"{mcp_url}/api/account-pnl?account={acct}")
             for acct in accounts
         }
 
-        (summary, positions, fx_json, margin_json, stress_json) = await asyncio.gather(
-            summary_task, positions_task, fx_task, margin_task, stress_task
+        (summary, fx_json, margin_json, stress_json) = await asyncio.gather(
+            summary_task, fx_task, margin_task, stress_task
         )
+        pos_results = dict(zip(pos_tasks.keys(), await asyncio.gather(*pos_tasks.values())))
         pnl_results = dict(zip(pnl_tasks.keys(), await asyncio.gather(*pnl_tasks.values())))
         pnl_md = {a: (r or {}).get("markdown", "") for a, r in pnl_results.items()}
+
+        # Concatenate every account's positions into one dict shaped like the
+        # single-account response, so downstream code (and brief helpers) are
+        # account-agnostic.
+        all_rows: list[dict] = []
+        for acct, res in pos_results.items():
+            if res and isinstance(res.get("positions"), list):
+                all_rows.extend(res["positions"])
+        positions = {"positions": all_rows, "merged": []} if all_rows else None
+        if not all_rows:
+            errors.append("positions fetch failed")
 
         fx_rates: dict[str, float] = {}
         if fx_json and "prices" in fx_json:
@@ -98,14 +117,25 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             if "price" in usdcad:
                 fx_rates["USDCAD"] = float(usdcad["price"])
 
+        # Pull live day-change for every held symbol in one batch. Positions
+        # rows carry market_price but no day move; /api/prices has
+        # change/change_pct/previous_close per symbol.
+        prices: dict[str, dict] = {}
+        symbols = sorted({r["symbol"] for r in all_rows})
+        if symbols:
+            pr_json = await bf._fetch_json(
+                session, f"{mcp_url}/api/prices?symbols={','.join(symbols)}"
+            )
+            if pr_json and isinstance(pr_json.get("prices"), dict):
+                prices = pr_json["prices"]
+
         if summary is None:
             errors.append("summary fetch failed")
-        if positions is None:
-            errors.append("positions fetch failed")
 
         return ReportData(
             summary=summary,
             positions=positions,
+            prices=prices,
             margin_md=(margin_json or {}).get("markdown") if margin_json else None,
             stress_md=(stress_json or {}).get("markdown") if stress_json else None,
             fx_rates=fx_rates,
@@ -198,14 +228,39 @@ def _parse_stress(md: Optional[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Column grid
+# ---------------------------------------------------------------------------
+#
+# Everything aligns to ONE grid so columns line up across every section. The
+# content width is 30 chars (fits a 32-char mobile code block with margin).
+# `_kv` renders a left label padded to LABEL_W, then a value right-aligned to
+# the remaining width, so all values share a right edge.
+
+CONTENT_W = 30
+LABEL_W = 8
+
+
+def _kv(label: str, value: str) -> str:
+    """label left-padded to LABEL_W, value right-aligned to fill CONTENT_W."""
+    value_w = CONTENT_W - LABEL_W
+    return f"{label:<{LABEL_W}}{value:>{value_w}}"
+
+
+def _arrow(n: float) -> str:
+    return "▲" if n > 0 else "▼" if n < 0 else "―"
+
+
+# ---------------------------------------------------------------------------
 # Report builder
 # ---------------------------------------------------------------------------
 
 def build_report(data: ReportData) -> str:
     """Mobile-friendly detailed report, CAD, wrapped in a code block.
 
-    Every line ≤ 32 chars (narrow mobile Discord code block). Sections:
-    §1 header · §2 margin · §3 positions · §4 concentration · §5 stress.
+    Every line ≤ 32 chars (narrow mobile Discord code block), columns aligned
+    to a shared grid throughout. Sections: §1 header · §2 margin · §3 positions
+    (current price, day $/%, mkt value, unrealized) · §4 concentration ·
+    §5 stress. Positions merge across accounts by symbol.
     """
     if not data.healthy:
         return "⚠️ report unavailable — ibkr mcp not responding."
@@ -218,74 +273,92 @@ def build_report(data: ReportData) -> str:
         lines.append(f"CAD · USDCAD {usdcad:.4f}")
         lines.append("")
 
-    # §1 header — full numbers
+    # §1 header — combined + per-account, full numbers, aligned grid
     summary = data.summary or {}
     combined = summary.get("combined_nlv")
     if combined is not None:
-        lines.append(f"NLV  {_money_full(combined)}")
+        lines.append(_kv("NLV", _money_full(combined)))
         lines.append("")
 
     for acct in summary.get("accounts", []):
         acct_id = acct.get("account", "?")
         if acct.get("error") or acct.get("nlv") is None:
             lines.append(acct_id)
-            lines.append(f"  ⚠️ {acct.get('error', 'no data')}")
+            lines.append(f"  ⚠️ {acct.get('error', 'no data')}"[:CONTENT_W])
             lines.append("")
             continue
 
-        nlv = acct.get("nlv", 0)
         cushion = acct.get("cushion_pct", 0)
         pnl_tuple = bf._extract_daily_pnl(data.pnl_by_account.get(acct_id, ""))
 
         lines.append(acct_id)
-        lines.append(f"  nlv   {_money_full(nlv)}")
+        lines.append(_kv("  nlv", _money_full(acct.get("nlv", 0))))
         if pnl_tuple:
             d, p = pnl_tuple
-            lines.append(f"  day   {_money_full(d)} ({bf._pct(p)})")
-        lines.append(f"  cash  {_money_full(acct.get('cash', 0))}")
-        lines.append(f"  bp    {_money_full(acct.get('buying_power', 0))}")
-        lines.append(f"  gpv   {_money_full(acct.get('gpv', 0))}")
-        lines.append(f"  lev   {acct.get('leverage', 0):.2f}x")
-        lines.append(f"  util  {acct.get('margin_util_pct', 0):.0f}%")
+            lines.append(_kv("  day", f"{_money_full(d)} {bf._pct(p)}"))
+        lines.append(_kv("  cash", _money_full(acct.get("cash", 0))))
+        lines.append(_kv("  bp", _money_full(acct.get("buying_power", 0))))
+        lines.append(_kv("  gpv", _money_full(acct.get("gpv", 0))))
+        lines.append(_kv("  lev", f"{acct.get('leverage', 0):.2f}x"))
+        lines.append(_kv("  util", f"{acct.get('margin_util_pct', 0):.0f}%"))
         tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
-        lines.append(f"  cush  {cushion:.1f}% ({tag})")
+        lines.append(_kv("  cush", f"{cushion:.1f}% ({tag})"))
         lines.append("")
 
-    # §2 margin — granular distances from /api/margin
+    # §2 margin — granular distances from /api/margin, aligned
     m = _parse_margin(data.margin_md)
     if m and any(v is not None for v in m.values()):
         lines.append("⚖️ MARGIN")
         if m.get("excess_maint") is not None:
-            lines.append(f"  excess liq")
-            lines.append(f"  {_money_full(m['excess_maint'])}")
+            lines.append(_kv("  exliq", _money_full(m["excess_maint"])))
         if m.get("maint_drawdown_pct") is not None:
-            lines.append(f"  dd to liq {m['maint_drawdown_pct']:.2f}%")
+            lines.append(_kv("  dd liq", f"{m['maint_drawdown_pct']:.2f}%"))
         if m.get("init_drawdown_pct") is not None:
-            lines.append(f"  dd to bp  {m['init_drawdown_pct']:.2f}%")
+            lines.append(_kv("  dd bp", f"{m['init_drawdown_pct']:.2f}%"))
         lines.append("")
 
-    # §3 positions — full value + weight + unrealized
+    # §3 positions — merged across accounts, with live day-change.
+    # 3-line card per holding, columns aligned to the grid:
+    #   SYM            weight%   price
+    #    day  +$x.xx (+x.xx%)
+    #    mv   $x,xxx   uP +x.x%
     if data.positions:
         rows = bf._combine_positions(data.positions, data.fx_rates)
         weights = _position_weights(data.positions)
         if rows:
             lines.append("📈 POSITIONS")
             for r in rows:
-                label = r["label"][:6]
-                w = weights.get(r["symbol"])
-                wtxt = f"{w:.1f}%" if w is not None else "  -"
-                lines.append(f"  {label:<6} {wtxt:>6}")
-                mv = _money_full(r["market_value_cad"])
-                pl = bf._pct(r["unrealized_pct"])
-                lines.append(f"    {mv}  {pl}")
+                sym = r["symbol"]
+                label = r["label"][:7]
+                w = weights.get(sym)
+                wtxt = f"{w:.1f}%" if w is not None else "-"
+                px = data.prices.get(sym, {})
+                price = px.get("price")
+                price_txt = f"${price:,.2f}" if price is not None else "—"
+                # line 1: SYM (label) ... weight ... current price.
+                # label left, the rest right-aligned to the shared 30-col edge.
+                right = f"{wtxt}  {price_txt}"
+                lines.append(f"{label:<8}{right:>{CONTENT_W - 8}}")
+                # line 2: day move from /api/prices (quote ccy)
+                chg = px.get("change")
+                chg_pct = px.get("change_pct")
+                if chg is not None and chg_pct is not None:
+                    day = f"{_arrow(chg)}${abs(chg):,.2f} {chg_pct:+.2f}%"
+                else:
+                    day = "n/a"
+                lines.append(_kv("  day", day))
+                # line 3: market value (CAD)
+                lines.append(_kv("  mv", _money_full(r["market_value_cad"])))
+                # line 4: unrealized %
+                lines.append(_kv("  uPnl", bf._pct(r["unrealized_pct"])))
             lines.append("")
 
             # §4 concentration — local, no endpoint
             wl = [w for w in weights.values() if w is not None]
             if wl:
                 lines.append("🎯 CONCENTRATION")
-                lines.append(f"  top-3  {_top_n_weight(wl, 3):.1f}%")
-                lines.append(f"  HHI    {_hhi(wl):.3f}")
+                lines.append(_kv("  top-3", f"{_top_n_weight(wl, 3):.1f}%"))
+                lines.append(_kv("  HHI", f"{_hhi(wl):.3f}"))
                 lines.append("")
 
     # §5 stress — fixed −10% preflight
@@ -293,9 +366,9 @@ def build_report(data: ReportData) -> str:
     if s and (s.get("buffer") is not None or s.get("verdict")):
         lines.append(f"⚠️ STRESS −{STRESS_DRAWDOWN_PCT:.0f}%")
         if s.get("verdict"):
-            lines.append(f"  {s['verdict'][:26]}")
+            lines.append(f"  {s['verdict'][:CONTENT_W - 2]}")
         if s.get("buffer") is not None:
-            lines.append(f"  buffer {_money_full(s['buffer'])}")
+            lines.append(_kv("  buffer", _money_full(s["buffer"])))
         lines.append("")
 
     lines.append("```")
@@ -303,8 +376,17 @@ def build_report(data: ReportData) -> str:
 
 
 def _position_weights(positions: dict) -> dict[str, Optional[float]]:
-    """Map symbol -> weight_pct as provided by the MCP (already % of NLV)."""
+    """Map symbol -> summed weight_pct across accounts (already % of NLV).
+
+    With multi-account merge, the same symbol can appear in two accounts; sum
+    their weights so the merged view reflects total portfolio exposure.
+    """
     out: dict[str, Optional[float]] = {}
     for p in positions.get("positions", []):
-        out[p["symbol"]] = p.get("weight_pct")
+        sym = p["symbol"]
+        w = p.get("weight_pct")
+        if w is None:
+            out.setdefault(sym, None)
+            continue
+        out[sym] = (out.get(sym) or 0.0) + w
     return out
