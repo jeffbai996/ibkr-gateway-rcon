@@ -408,7 +408,7 @@ def _account_card(data: ReportData, acct: dict) -> list[str]:
     # which trade at a fraction of the US parent). Day % from /api/prices (a
     # ratio, listing-agnostic).
     if acct_rows:
-        lines.append("  📈 positions")
+        lines.append(f"  📈 positions · {acct_id}")
         for r in acct_rows:
             ccy = r.get("currency", "USD")
             sym = r["symbol"] + ("(C)" if ccy != "USD" else "")

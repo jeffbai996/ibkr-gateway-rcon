@@ -159,6 +159,13 @@ def test_report_positions_show_weight_and_full_value():
     assert "312,000" in out            # market value, full number
 
 
+def test_report_positions_header_tagged_with_account():
+    """Positions sub-header must name its account so it's unambiguous whose
+    positions these are (Jeff: 'not obvious whose positions are whose')."""
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
+    assert "📈 positions · U1234567" in out
+
+
 def test_report_positions_price_from_row_not_join():
     # Price comes from the position ROW's market_price, never a ticker join.
     # This is the CDR fix: a CAD-listed line must show its own price, not the
