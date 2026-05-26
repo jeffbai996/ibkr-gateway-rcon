@@ -51,7 +51,6 @@ class ReportData:
     fx_rates: dict[str, float]
     healthy: bool
     dividends_md: Optional[str] = None  # /api/dividends markdown
-    prices: dict[str, dict] = field(default_factory=dict)  # symbol -> day-change
     fetch_errors: list[str] = field(default_factory=list)
     pnl_by_account: dict[str, str] = field(default_factory=dict)
 
@@ -119,25 +118,12 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             if "price" in usdcad:
                 fx_rates["USDCAD"] = float(usdcad["price"])
 
-        # Pull live day-change for every held symbol in one batch. Positions
-        # rows carry market_price but no day move; /api/prices has
-        # change/change_pct/previous_close per symbol.
-        prices: dict[str, dict] = {}
-        symbols = sorted({r["symbol"] for r in all_rows})
-        if symbols:
-            pr_json = await bf._fetch_json(
-                session, f"{mcp_url}/api/prices?symbols={','.join(symbols)}"
-            )
-            if pr_json and isinstance(pr_json.get("prices"), dict):
-                prices = pr_json["prices"]
-
         if summary is None:
             errors.append("summary fetch failed")
 
         return ReportData(
             summary=summary,
             positions=positions,
-            prices=prices,
             margin_md=(margin_json or {}).get("markdown") if margin_json else None,
             stress_md=(stress_json or {}).get("markdown") if stress_json else None,
             dividends_md=(div_json or {}).get("markdown") if div_json else None,
@@ -174,6 +160,25 @@ def _hhi(weights_pct: list[float]) -> float:
 def _top_n_weight(weights_pct: list[float], n: int) -> float:
     """Sum of the n largest weights (percent)."""
     return sum(sorted(weights_pct, reverse=True)[:n])
+
+
+def _unrealized_cad(rows: list[dict], fx: dict[str, float]) -> float:
+    """Sum unrealized P&L across position rows, converting each to CAD.
+
+    The positions feed denominates unrealized_pnl in each position's OWN
+    currency (USD rows in USD, CAD rows in CAD). Summing raw conflates
+    currencies — the bug that made the total wander. Convert per-row.
+
+    This is the AUTHORITATIVE unrealized figure: the positions feed is stable,
+    unlike /api/account-pnl which returns a partial value on the first cold
+    call after the gateway idles.
+    """
+    total = 0.0
+    for r in rows:
+        pnl = float(r.get("unrealized_pnl", 0) or 0)
+        ccy = r.get("currency", "USD")
+        total += bf._fx_to_cad(pnl, ccy, fx)
+    return total
 
 
 def _grab(md: str, label: str) -> Optional[str]:
@@ -244,16 +249,16 @@ def _parse_account_pnl(md: Optional[str]) -> dict:
     }
 
 
-def _sum_pnl(pnl_by_account: dict[str, str], key: str) -> Optional[float]:
-    """Sum a parsed P&L field across every account. None if nothing parsed."""
-    total = 0.0
-    seen = False
-    for md in pnl_by_account.values():
-        v = _parse_account_pnl(md).get(key)
-        if v is not None:
-            total += v
-            seen = True
-    return total if seen else None
+def _account_stale(md: Optional[str]) -> bool:
+    """True if the account-pnl markdown carries the MCP's cached-data warning.
+
+    When a gateway is offline the MCP serves last-known values and stamps
+    '⚠️ CACHED DATA — IB Gateway is offline.' Surfacing this stops a stale
+    snapshot being read as live.
+    """
+    if not md:
+        return False
+    return "CACHED DATA" in md or "Gateway is offline" in md
 
 
 def _next_dividend(md: Optional[str]) -> Optional[str]:
@@ -306,13 +311,30 @@ def _arrow(n: float) -> str:
 # Report builder
 # ---------------------------------------------------------------------------
 
+def _account_rows(positions: Optional[dict], acct_id: str) -> list[dict]:
+    """Position rows belonging to one account, sorted by market value desc.
+
+    Values stay in each row's native currency; weight_pct is already % of that
+    account's NLV (so it sums to ~100 within the account — no cross-account
+    merge, which is what produced >100% concentration).
+    """
+    if not positions:
+        return []
+    rows = [r for r in positions.get("positions", []) if r.get("account") == acct_id]
+    rows.sort(key=lambda r: abs(float(r.get("market_value", 0) or 0)), reverse=True)
+    return rows
+
+
 def build_report(data: ReportData) -> str:
     """Mobile-friendly detailed report, CAD, wrapped in a code block.
 
-    Every line ≤ 32 chars (narrow mobile Discord code block), columns aligned
-    to a shared grid throughout. Sections: §1 header · §2 margin · §3 positions
-    (current price, day $/%, mkt value, unrealized) · §4 concentration ·
-    §5 stress. Positions merge across accounts by symbol.
+    Per-account sections so every number is attributable: combined NLV +
+    combined unrealized up top, then each account gets its own header, margin
+    snapshot, positions (its own weights/prices), and concentration. Columns
+    align to a shared 30-col grid; every line ≤ 32 chars.
+
+    Unrealized is summed from the STABLE positions feed (per-currency → CAD),
+    not the /api/account-pnl markdown which flickers on cold calls.
     """
     if not data.healthy:
         return "⚠️ report unavailable — ibkr mcp not responding."
@@ -323,139 +345,104 @@ def build_report(data: ReportData) -> str:
     usdcad = data.fx_rates.get("USDCAD")
     if usdcad:
         lines.append(f"CAD · USDCAD {usdcad:.4f}")
-        lines.append("")
 
-    # §1 header — combined + per-account, full numbers, aligned grid
     summary = data.summary or {}
+    accounts = summary.get("accounts", [])
+
+    # ---- Combined totals (the only cross-account aggregates) ----
     combined = summary.get("combined_nlv")
+    all_rows = (data.positions or {}).get("positions", [])
+    combined_unreal = _unrealized_cad(all_rows, data.fx_rates) if all_rows else None
     if combined is not None:
         lines.append(_kv("NLV", _money_full(combined)))
-        lines.append("")
+    if combined_unreal is not None:
+        lines.append(_kv("uPnl", _money_full(combined_unreal)))
+    lines.append("")
 
-    for acct in summary.get("accounts", []):
+    # ---- Per-account sections ----
+    for acct in accounts:
         acct_id = acct.get("account", "?")
+        # short tag for the header (last 4 of the IB account id)
+        short = acct_id[-4:] if len(acct_id) >= 4 else acct_id
+        stale = _account_stale(data.pnl_by_account.get(acct_id, ""))
+        head = f"━ {acct_id}" + (" ⚠️STALE" if stale else "")
+        lines.append(head[:CONTENT_W])
+
         if acct.get("error") or acct.get("nlv") is None:
-            lines.append(acct_id)
             lines.append(f"  ⚠️ {acct.get('error', 'no data')}"[:CONTENT_W])
             lines.append("")
             continue
 
         cushion = acct.get("cushion_pct", 0)
         pnl_tuple = bf._extract_daily_pnl(data.pnl_by_account.get(acct_id, ""))
+        acct_rows = _account_rows(data.positions, acct_id)
+        acct_unreal = _unrealized_cad(acct_rows, data.fx_rates) if acct_rows else None
 
-        lines.append(acct_id)
         lines.append(_kv("  nlv", _money_full(acct.get("nlv", 0))))
         if pnl_tuple:
             d, p = pnl_tuple
             lines.append(_kv("  day", f"{_money_full(d)} {bf._pct(p)}"))
+        if acct_unreal is not None:
+            lines.append(_kv("  uPnl", _money_full(acct_unreal)))
         lines.append(_kv("  cash", _money_full(acct.get("cash", 0))))
         lines.append(_kv("  bp", _money_full(acct.get("buying_power", 0))))
         lines.append(_kv("  gpv", _money_full(acct.get("gpv", 0))))
         lines.append(_kv("  lev", f"{acct.get('leverage', 0):.2f}x"))
         lines.append(_kv("  util", f"{acct.get('margin_util_pct', 0):.0f}%"))
+        excess = acct.get("excess_liquidity")
+        if excess is not None:
+            lines.append(_kv("  exliq", _money_full(excess)))
         tag = "ok" if cushion >= 10 else "tight" if cushion >= 5 else "CRIT"
         lines.append(_kv("  cush", f"{cushion:.1f}% ({tag})"))
         lines.append("")
 
-    # §2 margin — granular distances from /api/margin, aligned
-    m = _parse_margin(data.margin_md)
-    if m and any(v is not None for v in m.values()):
-        lines.append("⚖️ MARGIN")
-        if m.get("excess_maint") is not None:
-            lines.append(_kv("  exliq", _money_full(m["excess_maint"])))
-        if m.get("maint_drawdown_pct") is not None:
-            lines.append(_kv("  dd liq", f"{m['maint_drawdown_pct']:.2f}%"))
-        if m.get("init_drawdown_pct") is not None:
-            lines.append(_kv("  dd bp", f"{m['init_drawdown_pct']:.2f}%"))
-        lines.append("")
-
-    # §3 positions — merged across accounts, with live day-change.
-    # 3-line card per holding, columns aligned to the grid:
-    #   SYM            weight%   price
-    #    day  +$x.xx (+x.xx%)
-    #    mv   $x,xxx   uP +x.x%
-    if data.positions:
-        rows = bf._combine_positions(data.positions, data.fx_rates)
-        weights = _position_weights(data.positions)
-        if rows:
-            lines.append("📈 POSITIONS")
-            for r in rows:
-                sym = r["symbol"]
-                label = r["label"][:7]
-                w = weights.get(sym)
+        # positions for THIS account — price/value from the row itself
+        # (the row carries the correct price for its OWN listing, incl. CDRs
+        # like AVGO(C) which trade at a fraction of the US parent — never join
+        # the US ticker quote by bare symbol, that was the price bug).
+        if acct_rows:
+            lines.append("  📈 positions")
+            for r in acct_rows:
+                ccy = r.get("currency", "USD")
+                sym = r["symbol"] + ("(C)" if ccy != "USD" else "")
+                label = sym[:8]   # 'AVGO(C)' = 7, NVDA(C) = 7; cap at 8
+                w = r.get("weight_pct")
                 wtxt = f"{w:.1f}%" if w is not None else "-"
-                px = data.prices.get(sym, {})
-                price = px.get("price")
+                price = r.get("market_price")
                 price_txt = f"${price:,.2f}" if price is not None else "—"
-                # line 1: SYM (label) ... weight ... current price.
-                # label left, the rest right-aligned to the shared 30-col edge.
                 right = f"{wtxt}  {price_txt}"
-                lines.append(f"{label:<8}{right:>{CONTENT_W - 8}}")
-                # line 2: day move from /api/prices (quote ccy)
-                chg = px.get("change")
-                chg_pct = px.get("change_pct")
-                if chg is not None and chg_pct is not None:
-                    day = f"{_arrow(chg)}${abs(chg):,.2f} {chg_pct:+.2f}%"
-                else:
-                    day = "n/a"
-                lines.append(_kv("  day", day))
-                # line 3-4: market value (CAD), unrealized $ + %
-                lines.append(_kv("  mv", _money_full(r["market_value_cad"])))
-                lines.append(_kv("  uPnl", bf._pct(r["unrealized_pct"])))
-                lines.append("")  # blank line between position cards
+                # 2-space indent + label, value right-aligned so the line is
+                # exactly CONTENT_W regardless of label/CDR length.
+                inner = f"{label:<8}{right:>{CONTENT_W - 2 - 8}}"
+                lines.append(f"  {inner}")
+                mv_cad = bf._fx_to_cad(float(r.get("market_value", 0) or 0), ccy, data.fx_rates)
+                up_cad = bf._fx_to_cad(float(r.get("unrealized_pnl", 0) or 0), ccy, data.fx_rates)
+                lines.append(_kv("    mv", _money_full(mv_cad)))
+                lines.append(_kv("    uP", _money_full(up_cad)))
+            lines.append("")
 
-            # §4 concentration — local, no endpoint
-            wl = [w for w in weights.values() if w is not None]
+            # concentration — within this account, weights sum to ~100
+            wl = [r["weight_pct"] for r in acct_rows if r.get("weight_pct") is not None]
             if wl:
-                lines.append("🎯 CONCENTRATION")
                 lines.append(_kv("  top-3", f"{_top_n_weight(wl, 3):.1f}%"))
                 lines.append(_kv("  HHI", f"{_hhi(wl):.3f}"))
                 lines.append("")
 
-    # §5 stress — fixed −10% preflight
+    # ---- Stress (whole-book preflight) ----
     s = _parse_stress(data.stress_md)
     if s and (s.get("buffer") is not None or s.get("verdict")):
-        lines.append(f"⚠️ STRESS −{STRESS_DRAWDOWN_PCT:.0f}%")
+        lines.append(f"⚠️ STRESS −{STRESS_DRAWDOWN_PCT:.0f}% (primary)")
         if s.get("verdict"):
             lines.append(f"  {s['verdict'][:CONTENT_W - 2]}")
         if s.get("buffer") is not None:
             lines.append(_kv("  buffer", _money_full(s["buffer"])))
         lines.append("")
 
-    # §6 P&L — combined unrealized + realized across all accounts
-    tot_unreal = _sum_pnl(data.pnl_by_account, "unrealized")
-    tot_real = _sum_pnl(data.pnl_by_account, "realized")
-    if tot_unreal is not None or tot_real is not None:
-        lines.append("💰 P&L (all acct)")
-        if tot_unreal is not None:
-            lines.append(_kv("  unreal", _money_full(tot_unreal)))
-        if tot_real is not None:
-            lines.append(_kv("  real", _money_full(tot_real)))
-        lines.append("")
-
-    # §7 income — next upcoming dividend
+    # ---- Next dividend ----
     nxt = _next_dividend(data.dividends_md)
     if nxt:
-        lines.append("💵 NEXT DIV")
-        lines.append(f"  {nxt}"[:CONTENT_W])
+        lines.append(_kv("next div", nxt))
         lines.append("")
 
     lines.append("```")
     return "\n".join(lines)
-
-
-def _position_weights(positions: dict) -> dict[str, Optional[float]]:
-    """Map symbol -> summed weight_pct across accounts (already % of NLV).
-
-    With multi-account merge, the same symbol can appear in two accounts; sum
-    their weights so the merged view reflects total portfolio exposure.
-    """
-    out: dict[str, Optional[float]] = {}
-    for p in positions.get("positions", []):
-        sym = p["symbol"]
-        w = p.get("weight_pct")
-        if w is None:
-            out.setdefault(sym, None)
-            continue
-        out[sym] = (out.get(sym) or 0.0) + w
-    return out

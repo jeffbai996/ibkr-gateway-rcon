@@ -90,16 +90,6 @@ _STRESS_MD = (
 )
 
 
-def _prices():
-    """Mirror /api/prices: per-symbol day move (price/change/change_pct)."""
-    return {
-        "AAPL": {"price": 260.40, "previous_close": 257.30, "change": 3.10, "change_pct": 1.20},
-        "MSFT": {"price": 335.00, "previous_close": 336.10, "change": -1.10, "change_pct": -0.33},
-        "GOOGL": {"price": 134.00, "previous_close": 131.20, "change": 2.80, "change_pct": 2.13},
-        "SGOV": {"price": 100.00, "previous_close": 100.00, "change": 0.00, "change_pct": 0.00},
-    }
-
-
 _PNL_MD = (
     "# Account P&L: U1234567\n\n"
     "**Daily P&L**: +$12,500.00 CAD (+0.97% of NLV)\n"
@@ -117,7 +107,7 @@ _DIVIDENDS_MD = (
 
 
 def _data(healthy=True, summary=None, positions=None,
-          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None, prices=None,
+          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None,
           pnl_by_account=None, dividends_md=_DIVIDENDS_MD):
     return rp.ReportData(
         summary=summary if summary is not None else _summary(),
@@ -127,7 +117,6 @@ def _data(healthy=True, summary=None, positions=None,
         dividends_md=dividends_md,
         fx_rates=fx_rates if fx_rates is not None else {"USDCAD": 1.37},
         healthy=healthy,
-        prices=prices if prices is not None else _prices(),
         pnl_by_account=pnl_by_account if pnl_by_account is not None
         else {"U1234567": _PNL_MD},
         fetch_errors=[],
@@ -153,42 +142,53 @@ def test_money_full_no_abbreviation():
 
 def test_report_has_all_built_sections():
     out = rp.build_report(_data())
-    # §1 header, §2 margin, §3 positions, §4 concentration, §5 stress
-    assert "1,284,300" in out          # full NLV
-    assert "MARGIN" in out.upper()
+    assert "1,284,300" in out          # combined NLV up top
+    assert "uPnl" in out               # combined unrealized
+    assert "U1234567" in out           # per-account section header
     assert "AAPL" in out               # positions
-    assert "HHI" in out.upper() or "CONC" in out.upper()  # concentration
-    assert "STRESS" in out.upper() or "DRAWDOWN" in out.upper()  # stress
+    assert "HHI" in out.upper()        # concentration
+    assert "STRESS" in out.upper()     # stress
 
 
 def test_report_positions_show_weight_and_full_value():
-    # USDCAD=1.0 here so native USD market values pass through unconverted,
-    # keeping the fixture's $312,000 readable in the assertion. (FX conversion
-    # itself is brief._combine_positions' job, tested in brief's suite.)
+    # USDCAD=1.0 → native USD values pass through, fixture $312,000 readable.
     out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
-    # weight_pct surfaced, market value in full numbers (no M/k)
-    assert "24.3" in out
-    assert "312,000" in out
+    assert "24.3" in out               # weight_pct (account-relative)
+    assert "312,000" in out            # market value, full number
 
 
-def test_report_positions_show_price_and_day_change():
+def test_report_positions_price_from_row_not_join():
+    # Price comes from the position ROW's market_price, never a ticker join.
+    # This is the CDR fix: a CAD-listed line must show its own price, not the
+    # US parent's. Here AAPL row price is 260.0 → must appear as $260.00.
     out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
-    assert "$260.40" in out          # current price from /api/prices
-    assert "+1.20%" in out           # day change pct
-    assert "$3.10" in out            # day change dollar
-    assert "-0.33%" in out           # a down mover (MSFT)
+    assert "$260.00" in out
 
 
-def test_report_day_change_missing_price_is_graceful():
-    # A held symbol with no price entry shows 'n/a' on the day line, no crash.
-    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}, prices={}))
-    assert "n/a" in out
-    assert "AAPL" in out
+def test_report_cdr_uses_own_listing_price():
+    # A CAD (CDR-style) line trades at a fraction of the US parent and must
+    # show its OWN market_price, labelled (C) — not the US ticker quote.
+    pos = {
+        "positions": [
+            {"symbol": "NVDA", "sec_type": "STK", "shares": 100,
+             "avg_cost": 200.0, "market_price": 215.33, "market_value": 21533.0,
+             "unrealized_pnl": 1533.0, "currency": "USD",
+             "weight_pct": 50.0, "account": "U1234567"},
+            {"symbol": "NVDA", "sec_type": "STK", "shares": 5000,
+             "avg_cost": 40.0, "market_price": 49.11, "market_value": 245550.0,
+             "unrealized_pnl": 45550.0, "currency": "CAD",
+             "weight_pct": 50.0, "account": "U1234567"},
+        ],
+        "merged": [],
+    }
+    out = rp.build_report(_data(positions=pos, fx_rates={"USDCAD": 1.0}))
+    assert "$215.33" in out            # US parent price
+    assert "$49.11" in out             # CDR's OWN price, NOT the parent's
+    assert "NVDA(C)" in out            # CDR labelled
 
 
 def test_report_columns_aligned():
-    # All _kv rows share the same content width — values right-aligned to a
-    # common edge. Check that lines using the grid end at a consistent column.
+    # All _kv rows share CONTENT_W — values right-aligned to a common edge.
     out = rp.build_report(_data())
     kv_lines = [l for l in out.split("\n")
                 if l.startswith(("  nlv", "  cash", "  bp", "  gpv",
@@ -198,20 +198,45 @@ def test_report_columns_aligned():
     assert widths == {rp.CONTENT_W}, f"misaligned widths: {widths}"
 
 
-def test_report_merges_positions_across_accounts():
-    # Same symbol held in two accounts merges into one row, weight summed.
+def test_unrealized_cad_sums_per_currency():
+    # The core fix: unrealized must convert each row by its OWN currency.
+    rows = [
+        {"unrealized_pnl": 1000.0, "currency": "USD"},
+        {"unrealized_pnl": 500.0, "currency": "CAD"},
+    ]
+    fx = {"USDCAD": 1.40}
+    # 1000 USD * 1.40 + 500 CAD = 1400 + 500 = 1900
+    assert abs(rp._unrealized_cad(rows, fx) - 1900.0) < 0.01
+
+
+def test_report_per_account_no_cross_account_weight_blowup():
+    # Two accounts each holding AAPL at 24.3% must NOT merge into 48.6% —
+    # concentration is computed within each account, so top-3 stays ≤100.
     pos = _positions()
     pos["positions"].append(
         {"symbol": "AAPL", "sec_type": "STK", "shares": 300,
          "avg_cost": 180.0, "market_price": 260.0, "market_value": 78000.0,
          "unrealized_pnl": 24000.0, "currency": "USD",
-         "weight_pct": 6.0, "account": "U7654321"},
+         "weight_pct": 60.0, "account": "U7654321"},
     )
-    out = rp.build_report(_data(positions=pos, fx_rates={"USDCAD": 1.0}))
-    # AAPL appears once; merged weight = 24.3 + 6.0 = 30.3
-    assert out.count("AAPL ") <= 1 or "AAPL" in out
-    weights = rp._position_weights(pos)
-    assert abs(weights["AAPL"] - 30.3) < 0.01
+    summ = _summary()
+    summ["accounts"].append({
+        "account": "U7654321", "currency": "CAD", "nlv": 130000.0,
+        "gpv": 130000.0, "cash": 0.0, "buying_power": 50000.0,
+        "init_margin": 0.0, "maint_margin": 0.0, "excess_liquidity": 50000.0,
+        "full_excess_liquidity": 50000.0, "cushion_pct": 40.0,
+        "leverage": 1.0, "margin_util_pct": 0.0,
+    })
+    out = rp.build_report(_data(positions=pos, summary=summ,
+                                pnl_by_account={"U1234567": _PNL_MD,
+                                                "U7654321": _PNL_MD},
+                                fx_rates={"USDCAD": 1.0}))
+    # Both account headers present
+    assert "U1234567" in out and "U7654321" in out
+    # No concentration figure exceeds 100% (the old merge bug gave 147%)
+    import re
+    for m in re.finditer(r"top-3\s+([\d.]+)%", out):
+        assert float(m.group(1)) <= 100.0, f"weight blowup: {m.group(1)}%"
 
 
 # ---------------------------------------------------------------------------
@@ -289,18 +314,25 @@ def test_account_pnl_parse():
     assert p["realized"] == 4200.0
 
 
-def test_sum_pnl_across_accounts():
-    pnl = {"A": _PNL_MD, "B": _PNL_MD}
-    assert rp._sum_pnl(pnl, "unrealized") == 232000.0  # 116k + 116k
-    assert rp._sum_pnl(pnl, "realized") == 8400.0
-    assert rp._sum_pnl({}, "unrealized") is None
+def test_account_stale_detects_cached_warning():
+    cached = _PNL_MD + "\n⚠️ **CACHED DATA** — IB Gateway is offline."
+    assert rp._account_stale(cached) is True
+    assert rp._account_stale(_PNL_MD) is False
+    assert rp._account_stale("") is False
 
 
-def test_report_shows_combined_pnl_block():
-    out = rp.build_report(_data())
-    assert "P&L" in out
-    assert "116,000" in out          # unrealized
-    assert "4,200" in out            # realized
+def test_report_flags_stale_account():
+    cached = _PNL_MD + "\n⚠️ **CACHED DATA** — IB Gateway is offline."
+    out = rp.build_report(_data(pnl_by_account={"U1234567": cached}))
+    assert "STALE" in out.upper()
+
+
+def test_combined_unrealized_uses_positions_feed():
+    # The fix: combined unrealized comes from summing the (stable) positions
+    # feed per-currency, NOT the flickering account-pnl markdown. With USDCAD=1
+    # the fixture's USD unrealized sums to 96000-1100+21000+0 = 115900.
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
+    assert "115,900" in out
 
 
 def test_next_dividend_picks_earliest():
@@ -310,19 +342,8 @@ def test_next_dividend_picks_earliest():
 
 def test_report_shows_next_dividend():
     out = rp.build_report(_data())
-    assert "NEXT DIV" in out
+    assert "next div" in out
     assert "AAPL" in out
-
-
-def test_report_blank_line_between_positions():
-    # Each position card is followed by a blank line for readability.
-    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
-    lines = out.split("\n")
-    # find the uPnl lines (last line of each card); the line after each is blank
-    upnl_idx = [i for i, l in enumerate(lines) if l.startswith("  uPnl")]
-    assert len(upnl_idx) >= 2
-    for i in upnl_idx:
-        assert lines[i + 1] == "", f"no blank line after card at line {i}"
 
 
 def test_report_still_mobile_width_with_extras():
