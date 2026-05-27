@@ -167,6 +167,18 @@ def _money_full(n: float) -> str:
     return f"{sign}${abs(n):,.0f}"
 
 
+def _money_compact(n: float) -> str:
+    """Abbreviated dollars for the narrow MV column: 2111789 -> '2.1M',
+    882349 -> '882k', 285 -> '285'. No $ sign (column header carries units)."""
+    a = abs(n)
+    sign = "-" if n < 0 else ""
+    if a >= 1_000_000:
+        return f"{sign}{a / 1_000_000:.1f}M"
+    if a >= 1_000:
+        return f"{sign}{a / 1_000:.0f}k"
+    return f"{sign}{a:.0f}"
+
+
 def _hhi(weights_pct: list[float]) -> float:
     """Herfindahl-Hirschman index over position weights (given as percents).
 
@@ -310,12 +322,11 @@ def _dividend_rows(md: Optional[str]) -> list[tuple[str, str, str, str]]:
 # ---------------------------------------------------------------------------
 #
 # Everything aligns to ONE grid so columns line up across every section. The
-# content width is 38 chars — a mobile Discord code block wraps around ~40 on
-# a phone, so 38 uses the real estate without wrapping. `_kv` renders a left
-# label padded to LABEL_W, then a value right-aligned to the remaining width,
-# so all values share a right edge.
+# content width is 39 chars — the measured wrap ceiling on Jeff's phone. `_kv`
+# renders a left label padded to LABEL_W, then a value right-aligned to the
+# remaining width, so all values share a right edge.
 
-CONTENT_W = 38
+CONTENT_W = 39
 LABEL_W = 10
 
 
@@ -409,30 +420,35 @@ def _account_card(data: ReportData, acct: dict) -> list[str]:
     # ratio, listing-agnostic).
     if acct_rows:
         lines.append(f"  📈 positions · {acct_id}")
+        # One row per holding, fixed columns aligned to a 39-char grid:
+        #   SYM(7) WT(5) PRICE(8) DAY(7) MV(6) uP(6)
+        # MV (market value, CAD) is abbreviated and DAY is the day-change % so
+        # the whole blotter fits the mobile width without wrapping. CDR (CAD)
+        # listings are suffixed "-C" and show their OWN price (not the US
+        # parent's). Full $ MV + unrealized $ stay available via the account
+        # totals (uPnl) up top.
+        # Flush-left (no indent) so the full 39-col grid is available; the
+        # 📈 header above already scopes the block to this account.
+        lines.append(
+            f"{'SYM':<7}{'WT':>5}{'PRICE':>8}{'DAY':>7}{'MV':>6}{'uP':>6}"
+        )
         for r in acct_rows:
             ccy = r.get("currency", "USD")
-            sym = r["symbol"] + ("(C)" if ccy != "USD" else "")
-            label = sym[:8]
+            sym = (r["symbol"] + ("-C" if ccy != "USD" else ""))[:7]
             w = r.get("weight_pct")
-            wtxt = f"{w:.1f}%" if w is not None else "-"
+            wt = f"{w:.1f}%" if w is not None else "-"
             price = r.get("market_price")
-            price_txt = f"${price:,.2f}" if price is not None else "—"
+            px = f"{price:,.1f}" if price is not None else "—"
             dp = data.day_pct.get(r["symbol"])
-            dtxt = f"{dp:+.2f}%" if dp is not None else "—"
-            # fixed sub-columns so weight / price / dayΔ% align vertically:
-            # label(8) wt(6) price(11) day(8).
-            lines.append(f"  {label:<8}{wtxt:>6}{price_txt:>11}{dtxt:>8}")
-            shares = r.get("shares")
-            avg = r.get("avg_cost")
-            if shares is not None and avg is not None:
-                lines.append(_kv("    qty@avg", f"{int(shares):,} @ ${avg:,.2f}"))
+            day = f"{dp:+.1f}%" if dp is not None else "—"
             mv_cad = bf._fx_to_cad(float(r.get("market_value", 0) or 0), ccy, data.fx_rates)
             up_native = float(r.get("unrealized_pnl", 0) or 0)
-            up_cad = bf._fx_to_cad(up_native, ccy, data.fx_rates)
-            cost = float(shares or 0) * float(avg or 0)
+            cost = float(r.get("shares") or 0) * float(r.get("avg_cost") or 0)
             up_pct = (up_native / cost * 100) if cost else 0.0
-            lines.append(_kv("    mkt val", _money_full(mv_cad)))
-            lines.append(_kv("    unreal", f"{_money_full(up_cad)} {up_pct:+.1f}%"))
+            up = f"{up_pct:+.0f}%"
+            lines.append(
+                f"{sym:<7}{wt:>5}{px:>8}{day:>7}{_money_compact(mv_cad):>6}{up:>6}"
+            )
         lines.append("")
 
         wl = [r["weight_pct"] for r in acct_rows if r.get("weight_pct") is not None]

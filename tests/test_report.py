@@ -152,11 +152,11 @@ def test_report_has_all_built_sections():
     assert "LIQUIDATION DISTANCE" in out.upper()  # whole-book risk (replaced bogus stress)
 
 
-def test_report_positions_show_weight_and_full_value():
-    # USDCAD=1.0 → native USD values pass through, fixture $312,000 readable.
+def test_report_positions_show_weight_and_compact_value():
+    # Blotter row: weight_pct + abbreviated market value (MV column).
     out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
     assert "24.3" in out               # weight_pct (account-relative)
-    assert "312,000" in out            # market value, full number
+    assert "312k" in out               # market value, compact ($312,000 → 312k)
 
 
 def test_report_positions_header_tagged_with_account():
@@ -167,16 +167,15 @@ def test_report_positions_header_tagged_with_account():
 
 
 def test_report_positions_price_from_row_not_join():
-    # Price comes from the position ROW's market_price, never a ticker join.
-    # This is the CDR fix: a CAD-listed line must show its own price, not the
-    # US parent's. Here AAPL row price is 260.0 → must appear as $260.00.
+    # Price comes from the position ROW's market_price (1 decimal), never a
+    # ticker join. AAPL row price 260.0 → '260.0' in the PRICE column.
     out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
-    assert "$260.00" in out
+    assert "260.0" in out
 
 
 def test_report_cdr_uses_own_listing_price():
     # A CAD (CDR-style) line trades at a fraction of the US parent and must
-    # show its OWN market_price, labelled (C) — not the US ticker quote.
+    # show its OWN market_price, suffixed "-C" — not the US ticker quote.
     pos = {
         "positions": [
             {"symbol": "NVDA", "sec_type": "STK", "shares": 100,
@@ -191,9 +190,9 @@ def test_report_cdr_uses_own_listing_price():
         "merged": [],
     }
     out = rp.build_report(_data(positions=pos, fx_rates={"USDCAD": 1.0}))
-    assert "$215.33" in out            # US parent price
-    assert "$49.11" in out             # CDR's OWN price, NOT the parent's
-    assert "NVDA(C)" in out            # CDR labelled
+    assert "215.3" in out              # US parent price (1 dp)
+    assert "49.1" in out               # CDR's OWN price, NOT the parent's
+    assert "NVDA-C" in out             # CDR suffixed -C
 
 
 def test_report_columns_aligned():
@@ -255,7 +254,7 @@ def test_report_per_account_no_cross_account_weight_blowup():
 def test_report_mobile_width():
     out = rp.build_report(_data())
     for line in out.split("\n"):
-        assert len(line) <= 38, f"line too wide ({len(line)}): {line!r}"
+        assert len(line) <= 39, f"line too wide ({len(line)}): {line!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +362,7 @@ def test_report_still_mobile_width_with_extras():
     # The new bottom blocks + spacing must not break the 32-char rule.
     out = rp.build_report(_data())
     for line in out.split("\n"):
-        assert len(line) <= 38, f"line too wide ({len(line)}): {line!r}"
+        assert len(line) <= 39, f"line too wide ({len(line)}): {line!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -425,4 +424,4 @@ def test_messages_default_is_both():
 def test_messages_each_line_within_width():
     for m in rp.build_report_messages(_two_account_data(), which="both"):
         for line in m.split("\n"):
-            assert len(line) <= 40, f"line too wide ({len(line)}): {line!r}"
+            assert len(line) <= 39, f"line too wide ({len(line)}): {line!r}"
