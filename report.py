@@ -363,6 +363,109 @@ def _dividend_block(data: ReportData) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Technicals — /gateway ta <symbol>
+# ---------------------------------------------------------------------------
+
+async def fetch_technicals(symbol: str, mcp_url: str = bf.MCP_DEFAULT_URL) -> Optional[str]:
+    """Fetch /api/technicals markdown for one symbol. None on failure."""
+    async with aiohttp.ClientSession() as session:
+        j = await bf._fetch_json(session, f"{mcp_url}/api/technicals?symbol={symbol}")
+    return (j or {}).get("markdown") if j else None
+
+
+def parse_technicals(md: Optional[str]) -> dict:
+    """Parse /api/technicals markdown into structured fields.
+
+    Source shape (per the live endpoint):
+      **Current Price**: $212.60 USD
+      | SMA(20) | $214.63 | -0.95% | Below |   (table rows)
+      **RSI**: 51.0 — Neutral
+      **52W High**: $236.54 USD (date) / **52W Low**: ...
+      **Percentile**: 76.9%
+      **From 52W High**: -10.12% / **From 52W Low**: +59.95%
+      **Vol Ratio (20d/60d)**: 1.14 — Stable
+      **20-Day Realized Vol**: 40.8%
+    """
+    if not md:
+        return {}
+    out: dict = {"symbol": None, "price": None, "sma": {}, "rsi": None,
+                 "rsi_label": None, "hi52": None, "lo52": None,
+                 "pctile": None, "from_hi": None, "from_lo": None,
+                 "vol_ratio": None, "vol_label": None, "rvol20": None}
+
+    title = re.search(r"#\s*(\S+)\s+Technical", md)
+    if title:
+        out["symbol"] = title.group(1)
+    out["price"] = _money_from(_grab(md, "Current Price"))
+
+    # SMA table rows: | SMA(20) | $214.63 | -0.95% | Below |
+    for m in re.finditer(r"SMA\((\d+)\)\s*\|\s*\$?([\d,.]+)\s*\|\s*([+-]?[\d.]+)%", md):
+        out["sma"][int(m.group(1))] = (
+            float(m.group(2).replace(",", "")), float(m.group(3))
+        )
+
+    rsi = re.search(r"\*\*RSI\*\*:\s*([\d.]+)\s*—\s*(\w+)", md)
+    if rsi:
+        out["rsi"] = float(rsi.group(1))
+        out["rsi_label"] = rsi.group(2)
+
+    out["hi52"] = _money_from(_grab(md, "52W High"))
+    out["lo52"] = _money_from(_grab(md, "52W Low"))
+    out["pctile"] = _pct_from(_grab(md, "Percentile"))
+    out["from_hi"] = _pct_from(_grab(md, "From 52W High"))
+    out["from_lo"] = _pct_from(_grab(md, "From 52W Low"))
+
+    vr = re.search(r"Vol Ratio \(20d/60d\)\*\*:\s*([\d.]+)\s*—\s*(\w+)", md)
+    if vr:
+        out["vol_ratio"] = float(vr.group(1))
+        out["vol_label"] = vr.group(2)
+    out["rvol20"] = _pct_from(_grab(md, "20-Day Realized Vol"))
+    return out
+
+
+def build_technicals(symbol: str, md: Optional[str]) -> str:
+    """Render a single-symbol technicals card, fenced, ≤39-col left-aligned."""
+    if not md:
+        return f"⚠️ no technicals for {symbol.upper()}."
+    t = parse_technicals(md)
+    sym = t.get("symbol") or symbol.upper()
+    lines = [f"📊 {sym} · technicals"]
+    if t.get("price") is not None:
+        lines.append(_kv("  price", f"${t['price']:,.2f}"))
+    if t.get("sma"):
+        lines.append("")
+        lines.append("  SMA (val · vs price)")
+        for window in (20, 50, 200):
+            if window in t["sma"]:
+                val, pct = t["sma"][window]
+                lines.append(_kv(f"    {window}", f"${val:,.2f} {pct:+.1f}%"))
+    if t.get("rsi") is not None:
+        lines.append("")
+        lines.append(_kv("  RSI(14)", f"{t['rsi']:.0f} {t.get('rsi_label') or ''}".strip()))
+    if t.get("hi52") is not None or t.get("lo52") is not None:
+        lines.append("")
+        lines.append("  52-week")
+        if t.get("hi52") is not None:
+            lines.append(_kv("    high", f"${t['hi52']:,.2f}"))
+        if t.get("lo52") is not None:
+            lines.append(_kv("    low", f"${t['lo52']:,.2f}"))
+        if t.get("pctile") is not None:
+            lines.append(_kv("    pctile", f"{t['pctile']:.0f}%"))
+        if t.get("from_hi") is not None:
+            lines.append(_kv("    from hi", f"{t['from_hi']:+.1f}%"))
+        if t.get("from_lo") is not None:
+            lines.append(_kv("    from lo", f"{t['from_lo']:+.1f}%"))
+    if t.get("vol_ratio") is not None or t.get("rvol20") is not None:
+        lines.append("")
+        lines.append("  volatility")
+        if t.get("vol_ratio") is not None:
+            lines.append(_kv("    20/60", f"{t['vol_ratio']:.2f}x {t.get('vol_label') or ''}".strip()))
+        if t.get("rvol20") is not None:
+            lines.append(_kv("    rVol20", f"{t['rvol20']:.1f}%"))
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+# ---------------------------------------------------------------------------
 # Column grid
 # ---------------------------------------------------------------------------
 #

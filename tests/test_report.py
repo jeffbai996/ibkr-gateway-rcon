@@ -460,3 +460,66 @@ def test_dividend_income_total_cad():
 def test_report_shows_dividend_income_total():
     out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
     assert "12M tot" in out
+
+
+# ---------------------------------------------------------------------------
+# Technicals (/gateway ta SYM)
+# ---------------------------------------------------------------------------
+
+_TECH_MD = (
+    "# NVDA Technical Analysis\n"
+    "**Current Price**: $212.60 USD\n\n"
+    "## Moving Averages\n"
+    "| SMA | Value | vs Price | Signal |\n"
+    "|-----|-------|----------|--------|\n"
+    "| SMA(20) | $214.63 | -0.95% | Below |\n"
+    "| SMA(50) | $198.09 | +7.33% | Above |\n"
+    "| SMA(200) | $187.35 | +13.48% | Above |\n\n"
+    "## RSI(14)\n**RSI**: 51.0 — Neutral\n\n"
+    "## 52-Week Range\n"
+    "**52W High**: $236.54 USD (2026-05-14)\n"
+    "**52W Low**: $132.92 USD (2025-05-30)\n"
+    "**Percentile**: 76.9%\n"
+    "**From 52W High**: -10.12%\n"
+    "**From 52W Low**: +59.95%\n\n"
+    "## Historical Volatility\n"
+    "**20-Day Realized Vol**: 40.8%\n"
+    "**Vol Ratio (20d/60d)**: 1.14 — Stable\n"
+)
+
+
+def test_parse_technicals_fields():
+    t = rp.parse_technicals(_TECH_MD)
+    assert t["symbol"] == "NVDA"
+    assert t["price"] == 212.60
+    assert t["sma"][20] == (214.63, -0.95)
+    assert t["sma"][50] == (198.09, 7.33)
+    assert t["sma"][200] == (187.35, 13.48)
+    assert t["rsi"] == 51.0
+    assert t["rsi_label"] == "Neutral"
+    assert t["hi52"] == 236.54
+    assert t["lo52"] == 132.92
+    assert t["pctile"] == 76.9
+    assert t["from_hi"] == -10.12
+    assert t["from_lo"] == 59.95
+    assert t["vol_ratio"] == 1.14
+    assert t["vol_label"] == "Stable"
+    assert t["rvol20"] == 40.8
+
+
+def test_build_technicals_card():
+    out = rp.build_technicals("nvda", _TECH_MD)
+    assert "NVDA · technicals" in out
+    assert "$212.60" in out
+    assert "214.63" in out and "-0.9%" in out   # SMA20
+    assert "51 Neutral" in out                  # RSI
+    assert "$236.54" in out                     # 52w high
+    assert "1.14x Stable" in out                # vol ratio
+    # fenced + mobile width
+    assert out.startswith("```") and out.rstrip().endswith("```")
+    for line in out.split("\n"):
+        assert len(line) <= 39, f"line too wide ({len(line)}): {line!r}"
+
+
+def test_build_technicals_no_data():
+    assert "no technicals" in rp.build_technicals("XYZ", None).lower()

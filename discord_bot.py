@@ -629,6 +629,19 @@ def build_bot() -> discord.Client:
             out = out[:1950] + "…"
         await interaction.followup.send(out)
 
+    @group.command(name="ta", description="Technicals for one symbol (SMA/RSI/52w/vol)")
+    @app_commands.describe(symbol="Ticker, e.g. nvda")
+    async def ta_cmd(interaction: discord.Interaction, symbol: str):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        await interaction.response.defer(thinking=True)
+        sym = symbol.strip().upper()
+        if not sym:
+            return await interaction.followup.send("usage: `/gateway ta nvda`")
+        md = await rp.fetch_technicals(sym, bf.mcp_url_from_env())
+        out = rp.build_technicals(sym, md)
+        await interaction.followup.send(out)
+
     # Register globally; on_ready will copy to the guild for instant availability.
     tree.add_command(group)
 

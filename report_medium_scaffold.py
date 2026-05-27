@@ -57,26 +57,9 @@ def render_sectors(rows: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Technicals — /gateway ta <SYMBOL>
+# 2. Technicals — /gateway ta <SYMBOL>   ✅ BUILT (see report.parse_technicals /
+#    build_technicals / fetch_technicals + ta_cmd in discord_bot.py)
 # ---------------------------------------------------------------------------
-#
-# Goal: a per-symbol technicals card (RSI, SMA20/50/200, 52w hi/lo, vs-MA%).
-# Data: /api/technicals?symbol=<SYM> already exists (markdown). Per-symbol
-# only — do NOT loop over all holdings (rate/latency cost). New subcommand
-# `/gateway ta SYM`, separate from `report`.
-#
-# OPEN QUESTION: parse the markdown into fields (consistent layout?) vs. pass
-# the markdown through lightly reformatted. Need to see live /api/technicals
-# output shape before committing to a parser.
-
-def parse_technicals(md: Optional[str]) -> dict:
-    """Parse /api/technicals markdown → {rsi, sma20, sma50, sma200, hi52, lo52}."""
-    raise NotImplementedError
-
-
-def render_technicals(symbol: str, md: Optional[str]) -> str:
-    """Render a single-symbol technicals card (own fenced message)."""
-    raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
