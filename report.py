@@ -317,29 +317,74 @@ def _dividend_rows(md: Optional[str]) -> list[tuple[str, str, str, str]]:
     return out
 
 
+def _dividend_income_cad(
+    divs: list[tuple[str, str, str, str]],
+    positions: Optional[dict],
+    fx: dict[str, float],
+) -> Optional[float]:
+    """Expected next-12-month dividend income in CAD.
+
+    Σ over holdings of (next-12M per-share × shares), converted to CAD. The
+    calendar's Next-12M column is per share; shares come from the positions
+    feed. Returns None if nothing computable.
+    """
+    if not divs or not positions:
+        return None
+    shares_by_sym: dict[str, tuple[float, str]] = {}
+    for p in positions.get("positions", []):
+        shares_by_sym[p["symbol"]] = (
+            float(p.get("shares") or 0), p.get("currency", "USD")
+        )
+    total = 0.0
+    seen = False
+    for sym, _ex, _amt, nxt in divs:
+        m = re.search(r"-?[\d,]+(?:\.\d+)?", nxt or "")
+        if not m or sym not in shares_by_sym:
+            continue
+        per_share = float(m.group(0).replace(",", ""))
+        shares, ccy = shares_by_sym[sym]
+        total += bf._fx_to_cad(per_share * shares, ccy, fx)
+        seen = True
+    return total if seen else None
+
+
+def _dividend_block(data: ReportData) -> list[str]:
+    """Shared dividend section: per-holding calendar + next-12M income total."""
+    divs = _dividend_rows(data.dividends_md)
+    if not divs:
+        return []
+    out = ["💵 DIVIDENDS (ex · /sh · 12M)"]
+    for sym, ex, amt, fwd in divs:
+        out.append(_kv(f"  {sym}", f"{ex[5:]} {amt} {fwd}"))
+    income = _dividend_income_cad(divs, data.positions, data.fx_rates)
+    if income is not None:
+        out.append(_kv("  12M tot", _money_full(income)))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Column grid
 # ---------------------------------------------------------------------------
 #
 # Everything aligns to ONE grid so columns line up across every section. The
-# content width is 39 chars — the measured wrap ceiling on Jeff's phone. `_kv`
-# renders a left label padded to LABEL_W, then a value right-aligned to the
-# remaining width, so all values share a right edge.
+# content width is 39 chars — the measured wrap ceiling on Jeff's phone.
+# `_kv` left-aligns: label padded to LABEL_W, then the value starts at a fixed
+# column and is LEFT-justified (Jeff prefers left-aligned numbers — they form
+# a clean left edge under the label column rather than a ragged right edge).
 
 CONTENT_W = 39
-LABEL_W = 10
+LABEL_W = 12
 
 
 def _kv(label: str, value: str) -> str:
-    """Label left, value right-aligned so the line is exactly CONTENT_W.
+    """Label left-padded to LABEL_W, value left-aligned right after it.
 
-    Pads the label to at least LABEL_W, but if the label is longer (e.g. an
-    indented sub-row like '    init req') the value column shrinks to keep the
-    total at CONTENT_W — never overflows the mobile width.
+    If the label is longer than LABEL_W (an indented sub-row like
+    '    init req') it still gets one trailing space before the value so they
+    never run together.
     """
-    pad = max(LABEL_W, len(label))
-    value_w = max(CONTENT_W - pad, 1)
-    return f"{label:<{pad}}{value:>{value_w}}"
+    pad = max(LABEL_W, len(label) + 1)
+    return f"{label:<{pad}}{value}"
 
 
 def _arrow(n: float) -> str:
@@ -387,6 +432,18 @@ def _account_card(data: ReportData, acct: dict) -> list[str]:
         lines.append(_kv("  day", f"{_money_full(d)} {bf._pct(p)}"))
     if acct_unreal is not None:
         lines.append(_kv("  uPnl", _money_full(acct_unreal)))
+    # Realized P&L (today) — parsed from /api/account-pnl markdown.
+    realized = _parse_account_pnl(data.pnl_by_account.get(acct_id, "")).get("realized")
+    if realized is not None:
+        lines.append(_kv("  rPnl", _money_full(realized)))
+    # Cost basis = Σ(shares × avg_cost), per-currency → CAD.
+    cost_cad = sum(
+        bf._fx_to_cad(float(r.get("shares") or 0) * float(r.get("avg_cost") or 0),
+                      r.get("currency", "USD"), data.fx_rates)
+        for r in acct_rows
+    )
+    if acct_rows:
+        lines.append(_kv("  cost", _money_full(cost_cad)))
     lines.append(_kv("  cash", _money_full(acct.get("cash", 0))))
     lines.append(_kv("  bp", _money_full(acct.get("buying_power", 0))))
     lines.append(_kv("  gpv", _money_full(acct.get("gpv", 0))))
@@ -420,8 +477,8 @@ def _account_card(data: ReportData, acct: dict) -> list[str]:
     # ratio, listing-agnostic).
     if acct_rows:
         lines.append(f"  📈 positions · {acct_id}")
-        # One row per holding, fixed columns aligned to a 39-char grid:
-        #   SYM(7) WT(5) PRICE(8) DAY(7) MV(6) uP(6)
+        # One row per holding, LEFT-aligned columns on a 39-char grid:
+        #   SYM(7) WT(6) PRICE(8) DAY(7) MV(6) uP(5)
         # MV (market value, CAD) is abbreviated and DAY is the day-change % so
         # the whole blotter fits the mobile width without wrapping. CDR (CAD)
         # listings are suffixed "-C" and show their OWN price (not the US
@@ -430,7 +487,7 @@ def _account_card(data: ReportData, acct: dict) -> list[str]:
         # Flush-left (no indent) so the full 39-col grid is available; the
         # 📈 header above already scopes the block to this account.
         lines.append(
-            f"{'SYM':<7}{'WT':>5}{'PRICE':>8}{'DAY':>7}{'MV':>6}{'uP':>6}"
+            f"{'SYM':<7}{'WT':<6}{'PRICE':<8}{'DAY':<7}{'MV':<6}{'uP':<5}"
         )
         for r in acct_rows:
             ccy = r.get("currency", "USD")
@@ -447,7 +504,7 @@ def _account_card(data: ReportData, acct: dict) -> list[str]:
             up_pct = (up_native / cost * 100) if cost else 0.0
             up = f"{up_pct:+.0f}%"
             lines.append(
-                f"{sym:<7}{wt:>5}{px:>8}{day:>7}{_money_compact(mv_cad):>6}{up:>6}"
+                f"{sym:<7}{wt:<6}{px:<8}{day:<7}{_money_compact(mv_cad):<6}{up:<5}"
             )
         lines.append("")
 
@@ -517,12 +574,10 @@ def _report_lines(data: ReportData) -> list[str]:
     # ---- Whole-book liquidation distance (exact, from maint margin) ----
     lines.extend(_liquidation_distance(data, accounts))
 
-    # ---- Dividend calendar ----
-    divs = _dividend_rows(data.dividends_md)
-    if divs:
-        lines.append("💵 DIVIDENDS (ex · /sh · 12M)")
-        for sym, ex, amt, fwd in divs:
-            lines.append(_kv(f"  {sym}", f"{ex[5:]} {amt} {fwd}"))
+    # ---- Dividend calendar + next-12M income total ----
+    div_lines = _dividend_block(data)
+    if div_lines:
+        lines.extend(div_lines)
         lines.append("")
 
     # trailing blank is noise; drop it
@@ -612,14 +667,10 @@ def build_report_messages(data: ReportData, which: Optional[str] = None) -> list
         if all_rows:
             header.append(_kv("uPnl", _money_full(_unrealized_cad(all_rows, data.fx_rates))))
 
-    # Trailing block — stress + dividends (whole-book context).
+    # Trailing block — liquidation distance + dividends (whole-book context).
     trailer: list[str] = []
     trailer.extend(_liquidation_distance(data, accts))
-    divs = _dividend_rows(data.dividends_md)
-    if divs:
-        trailer.append("💵 DIVIDENDS (ex · /sh · 12M)")
-        for sym, ex, amt, fwd in divs:
-            trailer.append(_kv(f"  {sym}", f"{ex[5:]} {amt} {fwd}"))
+    trailer.extend(_dividend_block(data))
 
     messages: list[str] = []
     for i, acct in enumerate(accts):

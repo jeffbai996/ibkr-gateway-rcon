@@ -196,14 +196,16 @@ def test_report_cdr_uses_own_listing_price():
 
 
 def test_report_columns_aligned():
-    # All _kv rows share CONTENT_W — values right-aligned to a common edge.
+    # Left-aligned: every _kv value starts at the SAME column (LABEL_W), so
+    # the values form a clean left edge. Check the value-start index is shared.
     out = rp.build_report(_data())
     kv_lines = [l for l in out.split("\n")
                 if l.startswith(("  nlv", "  cash", "  bp", "  gpv",
-                                 "  lev", "  util", "  cush"))]
+                                 "  lev", "  util"))]
     assert kv_lines, "expected aligned account rows"
-    widths = {len(l) for l in kv_lines}
-    assert widths == {rp.CONTENT_W}, f"misaligned widths: {widths}"
+    # value starts right after the LABEL_W-padded label; find first '$'/digit col
+    starts = {len(l) - len(l[rp.LABEL_W:].lstrip()) for l in kv_lines}
+    assert starts == {rp.LABEL_W}, f"values not left-aligned to LABEL_W: {starts}"
 
 
 def test_unrealized_cad_sums_per_currency():
@@ -425,3 +427,36 @@ def test_messages_each_line_within_width():
     for m in rp.build_report_messages(_two_account_data(), which="both"):
         for line in m.split("\n"):
             assert len(line) <= 39, f"line too wide ({len(line)}): {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Cheap additions: realized P&L, cost basis, dividend income total
+# ---------------------------------------------------------------------------
+
+def test_report_shows_realized_pnl():
+    # _PNL_MD has Realized P&L +$4,200 → surfaced as rPnl in the header.
+    out = rp.build_report(_data())
+    assert "rPnl" in out
+    assert "4,200" in out
+
+
+def test_report_shows_cost_basis():
+    # Cost basis = Σ(shares × avg_cost). USDCAD=1.0 so it's the raw sum:
+    # 1200*180 + 800*300 + 1500*120 + 2900*100 = 216000+240000+180000+290000
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
+    assert "cost" in out
+    assert "926,000" in out
+
+
+def test_dividend_income_total_cad():
+    # Next-12M per share × shares, summed. _DIVIDENDS_MD: MSFT $3.10, AAPL $1.04.
+    # Positions: MSFT 800 sh, AAPL 1200 sh. USDCAD=1.0.
+    # 3.10*800 + 1.04*1200 = 2480 + 1248 = 3728
+    divs = rp._dividend_rows(_DIVIDENDS_MD)
+    income = rp._dividend_income_cad(divs, _positions(), {"USDCAD": 1.0})
+    assert abs(income - 3728.0) < 0.01
+
+
+def test_report_shows_dividend_income_total():
+    out = rp.build_report(_data(fx_rates={"USDCAD": 1.0}))
+    assert "12M tot" in out
