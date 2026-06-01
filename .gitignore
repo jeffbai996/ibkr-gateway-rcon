@@ -7,3 +7,6 @@ config.yaml
 state/
 *.log
 .DS_Store
+
+# secrets-bearing backups (never commit)
+.env.bak*
