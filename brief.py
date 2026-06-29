@@ -918,6 +918,121 @@ async def fetch_mcp_status(mcp_url: str = MCP_DEFAULT_URL) -> tuple[dict[str, di
     return per_gw, errs
 
 
+async def _resolve_account_label(
+    label: Optional[str], mcp_url: str
+) -> Optional[str]:
+    """Map a 'primary'/'secondary' label (or raw U-id) to an actual account ID.
+
+    The MCP's `resolve_account` doesn't know about these labels — it passes
+    whatever string you give it straight through to ib_insync, which then
+    returns empty data for unknown account IDs. So the bot has to do the
+    label→ID mapping itself, matching how report.py:_resolve_account_selector
+    does it (accounts[0] = primary, accounts[1] = secondary).
+
+    None or 'primary' → returns None (MCP defaults to its configured primary).
+    U-prefixed IDs pass through unchanged.
+    """
+    if not label or label == "primary":
+        return None
+    if label.startswith("U"):
+        return label
+    # Need to fetch the discovered account list to map 'secondary' → ID.
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        summary = await _fetch_json(session, f"{mcp_url}/api/summary")
+    if not summary:
+        raise RuntimeError(
+            "could not fetch /api/summary to resolve account label"
+        )
+    accounts = summary.get("accounts", [])
+    if label == "secondary":
+        if len(accounts) < 2:
+            raise RuntimeError(
+                "only one account configured — 'secondary' is not available"
+            )
+        # Accounts in the order MCP returned them: 0=primary, 1=secondary.
+        acct = accounts[1]
+        return acct.get("account") if isinstance(acct, dict) else acct
+    raise RuntimeError(f"unknown account label: {label}")
+
+
+async def fetch_what_if(
+    action: str,
+    symbol: str,
+    quantity: int,
+    account: Optional[str] = None,
+    mcp_url: str = MCP_DEFAULT_URL,
+) -> str:
+    """Call /api/what-if; return the markdown payload.
+
+    Raises RuntimeError on non-200 or missing payload — caller surfaces the
+    message to the user via Discord followup.
+    """
+    resolved_account = await _resolve_account_label(account, mcp_url)
+    params = {
+        "action": action,
+        "symbol": symbol,
+        "quantity": str(quantity),
+    }
+    if resolved_account:
+        params["account"] = resolved_account
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(f"{mcp_url}/api/what-if", params=params) as resp:
+            if resp.status != 200:
+                body = (await resp.text())[:200]
+                raise RuntimeError(f"/api/what-if returned {resp.status}: {body}")
+            data = await resp.json()
+    md = data.get("markdown") if isinstance(data, dict) else None
+    if not md:
+        raise RuntimeError("/api/what-if returned no markdown payload")
+    return md
+
+
+def format_whatif_for_discord(md: str) -> str:
+    """Re-shape the MCP's what-if markdown for a Discord code-block render.
+
+    The MCP returns markdown with `**bold**` headers and `# h1` / `## h2`
+    section markers. Inside a Discord ``` code fence those render as literal
+    text — bold doesn't trigger, headers look like garbage. So we:
+
+      - strip `**` bold markers (they'd just show as asterisks in code blocks)
+      - convert `# H1` → uppercase header line; `## H2` → "── H2 ──" divider
+      - insert a visual divider line above any 'Excess Liquidity' row, since
+        that's the number the operator actually cares about
+      - wrap the whole thing in a triple-backtick code fence
+
+    Output stays inside Discord's 2000-char ceiling (truncated with a "…").
+    """
+    body_width = 38  # visual width of divider rules, fits comfortably mobile
+
+    out: list[str] = []
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        # Section headers
+        if line.startswith("## "):
+            title = line[3:].strip().replace("**", "")
+            ruler = "─" * max(2, (body_width - len(title) - 2) // 2)
+            out.append(f"{ruler} {title} {ruler}")
+            continue
+        if line.startswith("# "):
+            title = line[2:].strip().replace("**", "")
+            out.append(title)
+            continue
+        # Strip leftover bold markers anywhere on the line.
+        clean = line.replace("**", "")
+        # Highlight Excess Liquidity rows with a divider above them.
+        if "Excess Liquidity" in clean and out and out[-1].strip() != "":
+            out.append("─" * body_width)
+        out.append(clean)
+
+    text = "\n".join(out).rstrip()
+    # Reserve room for the code fence wrappers (~10 chars) within Discord's 2000 cap.
+    if len(text) > 1900:
+        text = text[:1870].rstrip() + "\n…"
+    return f"```\n{text}\n```"
+
+
 def _fmt_age(seconds: float) -> str:
     if seconds < 60:
         return f"{int(seconds)}s"

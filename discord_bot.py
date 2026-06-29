@@ -97,65 +97,6 @@ def _fmt_until_relative(dt: datetime, now: datetime) -> str:
     return f"for {delta / 86400:.1f}d more"
 
 
-def _fmt_status(cfg: gc.Config, mcp_per_gw: Optional[dict] = None) -> str:
-    """One block per gateway, stacked, <40 chars. Relative times for clarity.
-
-    `state:` reflects TCP port listening (gateway process state). The new
-    `mcp:` line reflects whether the MCP server can actually reach that
-    gateway — port-listening alone misses the "zombie process" case where
-    the gateway holds the socket but can't serve API calls.
-    """
-    probe = gc.make_port_probe(cfg.port_probe)
-    now = _now()
-    lines = ["```"]
-    for i, gw in enumerate(cfg.gateways):
-        st = gc.status_for(gw, port_listening=probe, log_path=cfg.log_file, now=now)
-        state = "running" if st.up else "stopped"
-
-        if st.skipped:
-            if st.skipped_until is None:
-                pause_line = "watchdog paused indefinitely"
-            else:
-                pause_line = f"watchdog paused {_fmt_until_relative(st.skipped_until, now)}"
-        else:
-            pause_line = "watchdog active"
-
-        if st.last_restart_at is None:
-            last_line = "no restarts on record"
-        else:
-            last_line = f"last restart {_fmt_age_relative(st.last_restart_at, now)}"
-
-        # MCP reachability: the truth-teller. Port listening != service healthy.
-        mcp_line = None
-        if mcp_per_gw is not None:
-            mcp_info = mcp_per_gw.get(gw.name)
-            if mcp_info is None:
-                mcp_line = "mcp: unknown"
-            elif not mcp_info.get("connected"):
-                mcp_line = "mcp: disconnected"
-            else:
-                age = mcp_info.get("last_data_age_s")
-                if age is None:
-                    mcp_line = "mcp: connected"
-                elif age < 60:
-                    mcp_line = f"mcp: connected ({int(age)}s data)"
-                elif age < 600:
-                    mcp_line = f"mcp: connected ({int(age/60)}m data)"
-                else:
-                    mcp_line = f"mcp: STALE ({_fmt_age_relative_short(age)} data)"
-
-        if i > 0:
-            lines.append("")
-        lines.append(f"{gw.name} (port {gw.port})")
-        lines.append(f"  state:   {state}")
-        if mcp_line is not None:
-            lines.append(f"  {mcp_line}")
-        lines.append(f"  {pause_line}")
-        lines.append(f"  {last_line}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
 def _fmt_age_relative_short(seconds: float) -> str:
     """Compact age for the STALE-data case: '5m', '2h', '1.3d'."""
     if seconds < 60:
@@ -246,19 +187,29 @@ def build_bot() -> discord.Client:
     # Build choices fresh from config so deploys pick up new gateways.
     gateway_choice = app_commands.choices(name=_choices(cfg))
 
-    @group.command(name="status", description="Show state of every gateway")
+    @group.command(name="status", description="Gateway state — process, uptime, restarts, heartbeat, MCP")
     async def status(interaction: discord.Interaction):
         if not _channel_ok(interaction):
             return await _reject_channel(interaction)
-        # Defer so the MCP probe doesn't race the 3s interaction timeout.
         await interaction.response.defer(thinking=True)
-        # MCP probe is best-effort — if it fails, we still render the
-        # process-level state, just without the mcp: line.
+        now = _now()
+        # MCP probe is best-effort — if it fails we still render the
+        # gateway-process section, just without the mcp: line.
         try:
-            mcp_per_gw, _ = await bf.fetch_mcp_status(bf.mcp_url_from_env())
+            mcp_per_gw, acct_errs = await bf.fetch_mcp_status(bf.mcp_url_from_env())
         except Exception:
-            mcp_per_gw = None
-        await interaction.followup.send(_fmt_status(cfg, mcp_per_gw))
+            mcp_per_gw, acct_errs = {}, []
+        data = await asyncio.to_thread(
+            bf.fetch_health_data,
+            cfg,
+            probe,
+            heartbeat,
+            _watchdog_interval(),
+            now,
+            mcp_per_gw,
+            acct_errs,
+        )
+        await interaction.followup.send(bf.build_health(data, now))
 
     def _targets_from_choice(choice: Optional[app_commands.Choice[str]]) -> list[gc.GatewayConfig]:
         """If no choice was made, default to every gateway."""
@@ -461,30 +412,6 @@ def build_bot() -> discord.Client:
             text = text[-1900:]
         await interaction.response.send_message(f"```\n{text}\n```")
 
-    @group.command(name="health", description="Gateway process health — uptime, restarts, heartbeat")
-    async def health(interaction: discord.Interaction):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
-        await interaction.response.defer(thinking=True)
-        now = _now()
-        # MCP probe is best-effort — if it fails we still render the
-        # gateway-process section, just without the mcp: line.
-        try:
-            mcp_per_gw, acct_errs = await bf.fetch_mcp_status(bf.mcp_url_from_env())
-        except Exception:
-            mcp_per_gw, acct_errs = {}, []
-        data = await asyncio.to_thread(
-            bf.fetch_health_data,
-            cfg,
-            probe,
-            heartbeat,
-            _watchdog_interval(),
-            now,
-            mcp_per_gw,
-            acct_errs,
-        )
-        await interaction.followup.send(bf.build_health(data, now))
-
     @group.command(name="brief", description="Portfolio brief: NLV, P&L, top positions, today's trades")
     async def brief_cmd(interaction: discord.Interaction):
         if not _channel_ok(interaction):
@@ -640,6 +567,57 @@ def build_bot() -> discord.Client:
             return await interaction.followup.send("usage: `/gateway ta nvda`")
         md = await rp.fetch_technicals(sym, bf.mcp_url_from_env())
         out = rp.build_technicals(sym, md)
+        await interaction.followup.send(out)
+
+    @group.command(name="whatif", description="Margin/equity impact of a hypothetical trade")
+    @app_commands.describe(
+        action="buy or sell",
+        symbol="Ticker, e.g. nvda",
+        quantity="Number of shares",
+        account="Account to simulate against",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="buy", value="buy"),
+        app_commands.Choice(name="sell", value="sell"),
+    ])
+    @app_commands.choices(account=[
+        app_commands.Choice(name="primary (default)", value="primary"),
+        app_commands.Choice(name="secondary", value="secondary"),
+    ])
+    async def whatif_cmd(
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        symbol: str,
+        quantity: int,
+        account: Optional[app_commands.Choice[str]] = None,
+    ):
+        if not _channel_ok(interaction):
+            return await _reject_channel(interaction)
+        if quantity <= 0:
+            return await interaction.response.send_message(
+                "⚠️ quantity must be positive", ephemeral=True,
+            )
+        await interaction.response.defer(thinking=True)
+        sym = symbol.strip().upper()
+        if not sym:
+            return await interaction.followup.send(
+                "usage: `/gateway whatif action:buy symbol:nvda quantity:100`"
+            )
+        # Resolve account: "primary"/"secondary" labels go to MCP which has its
+        # own resolve_account mapping. None or "primary" = default (omit param).
+        account_value = account.value if account is not None else None
+        try:
+            md = await bf.fetch_what_if(
+                action.value,
+                sym,
+                quantity,
+                account_value,
+                mcp_url=bf.mcp_url_from_env(),
+            )
+        except Exception as e:
+            log.exception("whatif fetch failed: %s", e)
+            return await interaction.followup.send(f"⚠️ what-if failed: {e}")
+        out = bf.format_whatif_for_discord(md)
         await interaction.followup.send(out)
 
     # Register globally; on_ready will copy to the guild for instant availability.
