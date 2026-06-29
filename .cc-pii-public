@@ -1,0 +1,2 @@
+# Force the shared cc-pii hook to scan identity/project PII here even though
+# this repo is allowlisted globally for local operations.
