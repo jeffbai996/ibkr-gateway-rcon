@@ -7,7 +7,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import brief as bf
-import discord_bot as db
 import gateway_ctl as gc
 
 
@@ -32,18 +31,6 @@ def _make_cfg(tmp_path: Path) -> gc.Config:
             ),
         ],
     )
-
-
-def test_fmt_age_relative_short_boundaries():
-    """Each boundary flips to the next unit cleanly."""
-    assert db._fmt_age_relative_short(5) == "5s"
-    assert db._fmt_age_relative_short(59) == "59s"
-    assert db._fmt_age_relative_short(60) == "1m"
-    assert db._fmt_age_relative_short(3599) == "59m"
-    assert db._fmt_age_relative_short(3600) == "1.0h"
-    assert db._fmt_age_relative_short(86399) == "24.0h"
-    assert db._fmt_age_relative_short(86400) == "1.0d"
-    assert db._fmt_age_relative_short(172800) == "2.0d"
 
 
 def _build_status(

@@ -550,30 +550,6 @@ def stop(gw: GatewayConfig, timeout: int = 60) -> Optional[subprocess.CompletedP
     return _run(gw.stop_cmd, timeout=timeout)
 
 
-def smart_restart(
-    gw: GatewayConfig,
-    port_listening: Callable[[int], bool],
-    restart_timeout: int = 240,
-    start_timeout: int = 240,
-) -> subprocess.CompletedProcess:
-    """If the gateway is already running, run restart. If it's stopped, run
-    start (falling back to restart if no start_cmd is configured). This is
-    what /gateway restart actually calls — 'restart' is the user's mental
-    model regardless of whether we need start or restart semantics.
-
-    Returns the CompletedProcess of whichever command ran.
-    """
-    if port_listening(gw.port):
-        return restart(gw, timeout=restart_timeout)
-    # Port is down — prefer cold start if configured.
-    started = start(gw, timeout=start_timeout)
-    if started is not None:
-        return started
-    # No start_cmd — fall back to restart. Many IBC restart scripts work
-    # from cold too, so this is usually fine.
-    return restart(gw, timeout=restart_timeout)
-
-
 def tail_log(log_path: Path, n: int = 20) -> list[str]:
     if not log_path.exists():
         return []

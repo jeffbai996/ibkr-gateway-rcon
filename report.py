@@ -30,11 +30,6 @@ import aiohttp
 
 import brief as bf
 
-# The −10% scenario used for the stress line. A proxy for "semis drop 10%"
-# since the whole book is concentrated semis; a portfolio-wide 10% drawdown
-# is the closest deterministic preflight the MCP exposes.
-STRESS_DRAWDOWN_PCT = 10.0
-
 _PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
@@ -46,7 +41,6 @@ _PACIFIC = ZoneInfo("America/Los_Angeles")
 class ReportData:
     summary: Optional[dict]
     positions: Optional[dict]
-    stress_md: Optional[str]        # /api/stress markdown (may be None on fail)
     fx_rates: dict[str, float]
     healthy: bool
     margin_by_account: dict[str, str] = field(default_factory=dict)  # acct -> /api/margin md
@@ -68,16 +62,16 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
         health = await bf._fetch_json(session, f"{mcp_url}/api/health")
         if not health or health.get("status") not in ("ok", "degraded"):
             errors.append("mcp health check failed")
-            return ReportData(None, None, None, None, {}, False, errors)
+            return ReportData(
+                summary=None, positions=None, fx_rates={}, healthy=False,
+                fetch_errors=errors,
+            )
 
         accounts = health.get("accounts", [])
         primary = accounts[0] if accounts else None
 
         summary_task = bf._fetch_json(session, f"{mcp_url}/api/summary")
         fx_task = bf._fetch_json(session, f"{mcp_url}/api/prices?symbols=USDCAD=X")
-        stress_task = bf._fetch_json(
-            session, f"{mcp_url}/api/stress?drawdown_pct={STRESS_DRAWDOWN_PCT}"
-        )
         dividends_task = bf._fetch_json(session, f"{mcp_url}/api/dividends")
         # /api/positions with no param only returns the PRIMARY account. Fetch
         # each account explicitly and concatenate, so a multi-account book shows
@@ -96,8 +90,8 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             acct: bf._fetch_json(session, f"{mcp_url}/api/margin?account={acct}")
             for acct in accounts
         }
-        (summary, fx_json, stress_json, div_json) = await asyncio.gather(
-            summary_task, fx_task, stress_task, dividends_task
+        (summary, fx_json, div_json) = await asyncio.gather(
+            summary_task, fx_task, dividends_task
         )
         pos_results = dict(zip(pos_tasks.keys(), await asyncio.gather(*pos_tasks.values())))
         pnl_results = dict(zip(pnl_tasks.keys(), await asyncio.gather(*pnl_tasks.values())))
@@ -143,7 +137,6 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             summary=summary,
             positions=positions,
             margin_by_account=margin_md_by_acct,
-            stress_md=(stress_json or {}).get("markdown") if stress_json else None,
             dividends_md=(div_json or {}).get("markdown") if div_json else None,
             fx_rates=fx_rates,
             healthy=True,
@@ -248,21 +241,6 @@ def _parse_margin(md: Optional[str]) -> dict:
         "init_drawdown_pct": _pct_from(_grab(md, "Before Buying Power Restricted (initial)")),
         "excess_init": _money_from(_grab(md, "Excess (Initial)")),
         "excess_maint": _money_from(_grab(md, "Excess (Maintenance)")),
-    }
-
-
-def _parse_stress(md: Optional[str]) -> dict:
-    """Extract verdict + buffer from the preflight stress markdown."""
-    if not md:
-        return {}
-    verdict = ""
-    vm = re.search(r"Verdict:\s*(.+)", md)
-    if vm:
-        verdict = vm.group(1).strip()
-    return {
-        "verdict": verdict,
-        "buffer": _money_from(_grab(md, "Buffer")),
-        "stressed_equity": _money_from(_grab(md, "Stressed Equity")),
     }
 
 

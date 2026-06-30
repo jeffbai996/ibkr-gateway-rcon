@@ -14,6 +14,7 @@ returned string.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ import gateway_ctl as gc
 
 MCP_DEFAULT_URL = "http://localhost:8001"
 
+log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # HTTP client
@@ -35,12 +38,17 @@ MCP_DEFAULT_URL = "http://localhost:8001"
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
+    """Single HTTP chokepoint for every MCP call. Degrades to None on any
+    failure — callers already render 'n/a'/'unavailable' for a None result —
+    but logs the cause so a failure is debuggable instead of silently absent."""
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
+                log.warning(f"MCP fetch {url} -> HTTP {resp.status}")
                 return None
             return await resp.json(content_type=None)
-    except Exception:
+    except Exception as e:
+        log.warning(f"MCP fetch {url} failed: {e}")
         return None
 
 
@@ -147,8 +155,13 @@ def _fx_to_cad(value: float, ccy: str, fx: dict[str, float]) -> float:
     return value
 
 
-def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
-    """Group positions by (symbol, currency), summing across accounts.
+def _combine_positions(
+    positions: dict,
+    fx: dict[str, float],
+    account: Optional[str] = None,
+) -> list[dict]:
+    """Group positions by (symbol, currency), summing across accounts (or
+    filtered to one account when `account` is given).
 
     Keeps CDR listings (CAD) as separate rows from their US parents — trying
     to merge them is meaningless because they have different shares-per-unit.
@@ -156,6 +169,8 @@ def _combine_positions(positions: dict, fx: dict[str, float]) -> list[dict]:
     """
     by_key: dict[tuple[str, str], dict] = {}
     for p in positions.get("positions", []):
+        if account is not None and p.get("account") != account:
+            continue
         sym = p["symbol"]
         ccy = p.get("currency", "USD")
         key = (sym, ccy)
@@ -241,14 +256,8 @@ def _today_trades_brief(trades_md: str, max_lines: int = 6) -> list[str]:
 def _money_cad(n: float) -> str:
     """Money formatter for values known to be in CAD. Strips the ccy suffix
     since the whole brief is single-currency. Default 2 decimal places on M,
-    1 on k."""
-    sign = "-" if n < 0 else ""
-    a = abs(n)
-    if a >= 1_000_000:
-        return f"{sign}${a/1_000_000:.2f}M"
-    if a >= 1_000:
-        return f"{sign}${a/1_000:.1f}k"
-    return f"{sign}${a:.0f}"
+    1 on k. Same threshold/precision logic as _money(); just no ccy suffix."""
+    return _money(n, ccy="").rstrip()
 
 
 def _money_cad_hi(n: float) -> str:
@@ -623,50 +632,7 @@ def _positions_for_account(
 ) -> list[dict]:
     """Positions combined across accounts (or filtered to one) and grouped by
     (symbol, currency) so CDR listings stay distinct from US parents."""
-    by_key: dict[tuple[str, str], dict] = {}
-    for p in positions_json.get("positions", []):
-        if account is not None and p.get("account") != account:
-            continue
-        sym = p["symbol"]
-        ccy = p.get("currency", "USD")
-        key = (sym, ccy)
-        if key not in by_key:
-            by_key[key] = {
-                "symbol": sym,
-                "currency": ccy,
-                "shares": 0.0,
-                "cost_total_native": 0.0,
-                "market_value_native": 0.0,
-                "unrealized_pnl_native": 0.0,
-            }
-        row = by_key[key]
-        shares = float(p.get("shares", 0))
-        avg_cost = float(p.get("avg_cost", 0))
-        row["shares"] += shares
-        row["cost_total_native"] += shares * avg_cost
-        row["market_value_native"] += float(p.get("market_value", 0))
-        row["unrealized_pnl_native"] += float(p.get("unrealized_pnl", 0))
-
-    out = []
-    for (sym, ccy), r in by_key.items():
-        avg_native = (r["cost_total_native"] / r["shares"]) if r["shares"] else 0.0
-        unreal_pct = (
-            (r["unrealized_pnl_native"] / r["cost_total_native"] * 100)
-            if r["cost_total_native"] else 0.0
-        )
-        label = sym if ccy == "USD" else f"{sym}(C)"
-        out.append({
-            "label": label,
-            "symbol": sym,
-            "currency": ccy,
-            "shares": r["shares"],
-            "avg_cost_cad": _fx_to_cad(avg_native, ccy, fx),
-            "market_value_cad": _fx_to_cad(r["market_value_native"], ccy, fx),
-            "unrealized_pnl_cad": _fx_to_cad(r["unrealized_pnl_native"], ccy, fx),
-            "unrealized_pct": unreal_pct,
-        })
-    out.sort(key=lambda r: r["market_value_cad"], reverse=True)
-    return out
+    return _combine_positions(positions_json, fx, account=account)
 
 
 def build_positions(

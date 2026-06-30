@@ -69,45 +69,6 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _fmt_age_relative(dt: datetime, now: datetime) -> str:
-    """Human-friendly relative age: '3m ago', '2h ago', '1d ago'."""
-    delta = (now - dt).total_seconds()
-    if delta < 0:
-        return "in the future (clock skew?)"
-    if delta < 60:
-        return f"{int(delta)}s ago"
-    if delta < 3600:
-        return f"{int(delta / 60)}m ago"
-    if delta < 86400:
-        return f"{delta / 3600:.1f}h ago"
-    return f"{delta / 86400:.1f}d ago"
-
-
-def _fmt_until_relative(dt: datetime, now: datetime) -> str:
-    """'until X' phrasing for future deadlines: 'for 25m more', 'for 1.5h more'."""
-    delta = (dt - now).total_seconds()
-    if delta <= 0:
-        return "expiring now"
-    if delta < 60:
-        return f"for {int(delta)}s more"
-    if delta < 3600:
-        return f"for {int(delta / 60)}m more"
-    if delta < 86400:
-        return f"for {delta / 3600:.1f}h more"
-    return f"for {delta / 86400:.1f}d more"
-
-
-def _fmt_age_relative_short(seconds: float) -> str:
-    """Compact age for the STALE-data case: '5m', '2h', '1.3d'."""
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    if seconds < 3600:
-        return f"{int(seconds / 60)}m"
-    if seconds < 86400:
-        return f"{seconds / 3600:.1f}h"
-    return f"{seconds / 86400:.1f}d"
-
-
 ALL_SENTINEL = "__all__"
 
 

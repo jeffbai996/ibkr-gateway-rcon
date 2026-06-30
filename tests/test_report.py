@@ -81,15 +81,6 @@ _MARGIN_MD = (
     "**Excess (Maintenance)**: $48,300.00 CAD\n"
 )
 
-_STRESS_MD = (
-    "# Preflight Check: 10.0% Drawdown\nAccount: U1234567\n\n"
-    "## Verdict: \U0001f7e2 OK\n\n"
-    "**Current Equity**: $1,284,300.00 CAD\n"
-    "**Stressed Equity** (after 10.0% drop): $1,155,870.00 CAD\n"
-    "**Buffer**: $74,500.00 CAD\n"
-)
-
-
 _PNL_MD = (
     "# Account P&L: U1234567\n\n"
     "**Daily P&L**: +$12,500.00 CAD (+0.97% of NLV)\n"
@@ -107,13 +98,12 @@ _DIVIDENDS_MD = (
 
 
 def _data(healthy=True, summary=None, positions=None,
-          margin_md=_MARGIN_MD, stress_md=_STRESS_MD, fx_rates=None,
+          margin_md=_MARGIN_MD, fx_rates=None,
           pnl_by_account=None, dividends_md=_DIVIDENDS_MD, day_pct=None):
     return rp.ReportData(
         summary=summary if summary is not None else _summary(),
         positions=positions if positions is not None else _positions(),
         margin_by_account={"U1234567": margin_md} if margin_md else {},
-        stress_md=stress_md,
         dividends_md=dividends_md,
         fx_rates=fx_rates if fx_rates is not None else {"USDCAD": 1.37},
         healthy=healthy,
@@ -281,12 +271,6 @@ def test_margin_parse_pulls_key_distances():
     assert m["cushion_pct"] == 8.04
     assert m["maint_drawdown_pct"] == 7.90  # before forced liquidation
     assert m["excess_init"] == 48300.0
-
-
-def test_stress_parse_pulls_buffer():
-    s = rp._parse_stress(_STRESS_MD)
-    assert s["buffer"] == 74500.0
-    assert "OK" in s["verdict"]
 
 
 # ---------------------------------------------------------------------------
