@@ -143,6 +143,15 @@ def build_bot() -> discord.Client:
             ephemeral=True,
         )
 
+    async def _guard_channel(interaction: discord.Interaction) -> bool:
+        """Channel allowlist check for every command. True if allowed; sends
+        the rejection message and returns False otherwise. Call site:
+        `if not await _guard_channel(interaction): return`"""
+        if _channel_ok(interaction):
+            return True
+        await _reject_channel(interaction)
+        return False
+
     group = app_commands.Group(name="gateway", description="Control IBKR gateways")
 
     # Build choices fresh from config so deploys pick up new gateways.
@@ -150,8 +159,8 @@ def build_bot() -> discord.Client:
 
     @group.command(name="status", description="Gateway state — process, uptime, restarts, heartbeat, MCP")
     async def status(interaction: discord.Interaction):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         now = _now()
         # MCP probe is best-effort — if it fails we still render the
@@ -189,8 +198,8 @@ def build_bot() -> discord.Client:
         name: Optional[app_commands.Choice[str]] = None,
         duration: Optional[str] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         targets = _targets_from_choice(name)
         if not targets:
             return await interaction.response.send_message("No gateways configured.", ephemeral=True)
@@ -211,8 +220,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         name: Optional[app_commands.Choice[str]] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         targets = _targets_from_choice(name)
         if not targets:
             return await interaction.response.send_message("No gateways configured.", ephemeral=True)
@@ -228,8 +237,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         name: Optional[app_commands.Choice[str]] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         targets = _targets_from_choice(name)
         if not targets:
             return await interaction.response.send_message("No gateways configured.", ephemeral=True)
@@ -304,8 +313,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         name: Optional[app_commands.Choice[str]] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         targets = _targets_from_choice(name)
         if not targets:
             return await interaction.response.send_message("No gateways configured.", ephemeral=True)
@@ -361,8 +370,8 @@ def build_bot() -> discord.Client:
     @group.command(name="tail", description="Show the tail of the watchdog log")
     @app_commands.describe(n="Number of lines (default 20, max 100).")
     async def tail(interaction: discord.Interaction, n: Optional[int] = 20):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         n = max(1, min(n or 20, 100))
         lines = gc.tail_log(cfg.log_file, n=n)
         if not lines:
@@ -375,8 +384,8 @@ def build_bot() -> discord.Client:
 
     @group.command(name="brief", description="Portfolio brief: NLV, P&L, top positions, today's trades")
     async def brief_cmd(interaction: discord.Interaction):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         data = await bf.fetch_brief_data(bf.mcp_url_from_env())
         out = bf.build_brief(data)
@@ -396,8 +405,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         account: Optional[app_commands.Choice[str]] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         which = account.value if account else "both"
         data = await rp.fetch_report_data(bf.mcp_url_from_env())
@@ -414,8 +423,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         account: Optional[str] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         view = await bf.fetch_account_view(
             bf.mcp_url_from_env(),
@@ -438,8 +447,8 @@ def build_bot() -> discord.Client:
         account: Optional[str] = None,
         top: Optional[int] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         n = max(1, min(int(top or 10), 25))
         view = await bf.fetch_account_view(
@@ -459,8 +468,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         account: Optional[str] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         view = await bf.fetch_account_view(
             bf.mcp_url_from_env(),
@@ -479,8 +488,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         account: Optional[str] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         view = await bf.fetch_account_view(
             bf.mcp_url_from_env(),
@@ -499,8 +508,8 @@ def build_bot() -> discord.Client:
         interaction: discord.Interaction,
         symbols: str,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
 
         syms = [s.strip().upper() for s in symbols.replace(",", " ").split() if s.strip()]
@@ -520,8 +529,8 @@ def build_bot() -> discord.Client:
     @group.command(name="ta", description="Technicals for one symbol (SMA/RSI/52w/vol)")
     @app_commands.describe(symbol="Ticker, e.g. nvda")
     async def ta_cmd(interaction: discord.Interaction, symbol: str):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         await interaction.response.defer(thinking=True)
         sym = symbol.strip().upper()
         if not sym:
@@ -552,8 +561,8 @@ def build_bot() -> discord.Client:
         quantity: int,
         account: Optional[app_commands.Choice[str]] = None,
     ):
-        if not _channel_ok(interaction):
-            return await _reject_channel(interaction)
+        if not await _guard_channel(interaction):
+            return
         if quantity <= 0:
             return await interaction.response.send_message(
                 "⚠️ quantity must be positive", ephemeral=True,
