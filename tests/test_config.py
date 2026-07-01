@@ -1,6 +1,4 @@
 """Tests for config loading and validation."""
-from pathlib import Path
-
 import pytest
 
 from gateway_ctl import Config, ConfigError, load_config

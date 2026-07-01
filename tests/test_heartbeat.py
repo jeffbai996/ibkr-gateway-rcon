@@ -1,6 +1,5 @@
 """Tests for heartbeat write/read — used by the deadman's switch."""
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from gateway_ctl import (
     is_heartbeat_stale,

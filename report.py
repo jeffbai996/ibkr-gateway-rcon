@@ -68,7 +68,6 @@ async def fetch_report_data(mcp_url: str = bf.MCP_DEFAULT_URL) -> ReportData:
             )
 
         accounts = health.get("accounts", [])
-        primary = accounts[0] if accounts else None
 
         summary_task = bf._fetch_json(session, f"{mcp_url}/api/summary")
         fx_task = bf._fetch_json(session, f"{mcp_url}/api/prices?symbols=USDCAD=X")
@@ -466,10 +465,6 @@ def _kv(label: str, value: str) -> str:
     """
     pad = max(LABEL_W, len(label) + 1)
     return f"{label:<{pad}}{value}"
-
-
-def _arrow(n: float) -> str:
-    return "▲" if n > 0 else "▼" if n < 0 else "―"
 
 
 # ---------------------------------------------------------------------------

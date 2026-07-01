@@ -1,9 +1,6 @@
 """Tests for skip-file read/write — the filesystem state the watchdog reads
 to decide whether to skip a gateway on its next tick."""
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-import pytest
 
 from gateway_ctl import (
     SkipState,

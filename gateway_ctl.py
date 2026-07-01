@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional

@@ -19,7 +19,6 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import gateway_ctl as gc
 

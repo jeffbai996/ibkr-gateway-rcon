@@ -9,8 +9,6 @@ the same function with zero divergence."""
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
-
 from gateway_ctl import (
     GatewayConfig,
     WatchdogAction,

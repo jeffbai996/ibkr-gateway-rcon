@@ -72,14 +72,6 @@ def _pct(n: float) -> str:
     return f"{sign}{n:.2f}%"
 
 
-def _emoji_pnl(n: float) -> str:
-    if n > 0:
-        return "🟢"
-    if n < 0:
-        return "🔴"
-    return "⚪"
-
-
 # ---------------------------------------------------------------------------
 # Brief — portfolio at a glance
 # ---------------------------------------------------------------------------
