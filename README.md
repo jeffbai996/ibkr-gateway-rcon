@@ -66,6 +66,20 @@ systemctl --user enable --now ibkr-gateway-rcon-deadman.timer
 /gateway quote <symbols>              live quotes — space-separated tickers (e.g. mu avgo nvda)
 ```
 
+**Risk & intelligence (require MCP reachability)**
+
+```
+/gateway drawdown                     NAV vs peak: drawdown %, recovery needed
+/gateway var                          1-day Value-at-Risk (95%/99%) + component breakdown
+/gateway correlation                  pairwise correlation matrix — hidden concentration
+/gateway sector                       sector exposure: weights + HHI concentration
+/gateway beta [benchmark]             portfolio beta vs benchmark (default SPY)
+/gateway geopolitical                 geopolitical risk mapped to held positions
+/gateway thesis <news>                check a news item against your thesis pillars
+/gateway rebalance <targets>          rebalance plan — targets as SYM:PCT,SYM:PCT
+/gateway compare <symbols>            relative performance across symbols
+```
+
 Duration in `/gateway pause` accepts `30m`, `2h`, `1d`, or an ISO-8601 timestamp. Omit for indefinite. Most control commands accept `name` *or* an `all` sentinel — omitting `name` defaults to all gateways.
 
 Output is mobile-friendly: code-block formatted with consistent column widths, `+1` decimal precision on NLV / day / liq / bp.

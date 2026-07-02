@@ -1168,3 +1168,28 @@ def build_quotes(
 
 def mcp_url_from_env() -> str:
     return os.environ.get("IBKR_MCP_URL", MCP_DEFAULT_URL)
+
+
+async def fetch_markdown_endpoint(path: str, mcp_url: str = MCP_DEFAULT_URL) -> Optional[str]:
+    """GET a markdown-returning /api/* route (e.g. '/api/drawdown?account=X').
+
+    Returns the 'markdown' field, or None on any failure. Shared by the ported
+    Tier-1 risk/intelligence commands, which all pass MCP tool output through.
+    """
+    url = f"{mcp_url}{path}"
+    async with aiohttp.ClientSession() as session:
+        j = await _fetch_json(session, url)
+    return (j or {}).get("markdown") if j else None
+
+
+def clean_markdown_for_discord(md: Optional[str], title: str) -> str:
+    """Strip MCP markdown bold/headers and fence for Discord. None -> friendly note."""
+    if not md:
+        return f"⚠️ {title}: no data (gateway may be down)."
+    import re as _re
+    out = _re.sub(r"\*\*(.+?)\*\*", r"\1", md)   # **bold** -> bold
+    out = _re.sub(r"^#{1,4}\s*", "", out, flags=_re.M)  # ## header -> plain
+    out = out.strip()
+    if len(out) > 1900:
+        out = out[:1900] + "\n…"
+    return f"```\n{out}\n```"

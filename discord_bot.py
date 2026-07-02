@@ -592,6 +592,118 @@ def build_bot() -> discord.Client:
         out = bf.format_whatif_for_discord(md)
         await interaction.followup.send(out)
 
+    # --- Tier-1 risk / intelligence commands (ported to richer MCP tools) ---
+
+    @group.command(name="drawdown", description="NAV vs peak: drawdown %, recovery needed")
+    @app_commands.describe(account="Account ID. Omit for primary.")
+    async def drawdown_cmd(interaction: discord.Interaction, account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        q = f"?account={account}" if account else ""
+        md = await bf.fetch_markdown_endpoint(f"/api/drawdown{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "drawdown"))
+
+    @group.command(name="var", description="1-day Value-at-Risk (95%/99%) + component breakdown")
+    @app_commands.describe(account="Account ID. Omit for primary.")
+    async def var_cmd(interaction: discord.Interaction, account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        q = f"?account={account}" if account else ""
+        md = await bf.fetch_markdown_endpoint(f"/api/var{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "VaR"))
+
+    @group.command(name="correlation", description="Pairwise correlation matrix — hidden concentration")
+    @app_commands.describe(account="Account ID. Omit for primary.")
+    async def correlation_cmd(interaction: discord.Interaction, account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        q = f"?account={account}" if account else ""
+        md = await bf.fetch_markdown_endpoint(f"/api/correlation{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "correlation"))
+
+    @group.command(name="sector", description="Sector exposure: weights + HHI concentration")
+    @app_commands.describe(account="Account ID. Omit for primary.")
+    async def sector_cmd(interaction: discord.Interaction, account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        q = f"?account={account}" if account else ""
+        md = await bf.fetch_markdown_endpoint(f"/api/sector{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "sector"))
+
+    @group.command(name="beta", description="Portfolio beta vs benchmark (default SPY)")
+    @app_commands.describe(benchmark="Benchmark symbol (default SPY)", account="Account ID.")
+    async def beta_cmd(interaction: discord.Interaction, benchmark: Optional[str] = None,
+                       account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        parts = []
+        if benchmark:
+            parts.append(f"benchmark={benchmark.strip().upper()}")
+        if account:
+            parts.append(f"account={account}")
+        q = ("?" + "&".join(parts)) if parts else ""
+        md = await bf.fetch_markdown_endpoint(f"/api/beta{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "beta"))
+
+    @group.command(name="geopolitical", description="Geopolitical risk mapped to held positions")
+    @app_commands.describe(account="Account ID. Omit for primary.")
+    async def geopolitical_cmd(interaction: discord.Interaction, account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        q = f"?account={account}" if account else ""
+        md = await bf.fetch_markdown_endpoint(f"/api/geopolitical{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "geopolitical"))
+
+    @group.command(name="thesis", description="Check a news item against your thesis pillars")
+    @app_commands.describe(news="Headline / development to validate")
+    async def thesis_cmd(interaction: discord.Interaction, news: str):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        from urllib.parse import quote_plus
+        md = await bf.fetch_markdown_endpoint(
+            f"/api/thesis?news_item={quote_plus(news)}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "thesis check"))
+
+    @group.command(name="rebalance", description="Rebalance plan: current vs target, trades to hit it")
+    @app_commands.describe(targets="Targets as SYM:PCT pairs, e.g. MU:25,NVDA:30,SGOV:20",
+                           account="Account ID. Omit for primary.")
+    async def rebalance_cmd(interaction: discord.Interaction, targets: str,
+                            account: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        from urllib.parse import quote_plus
+        q = f"?targets={quote_plus(targets)}"
+        if account:
+            q += f"&account={account}"
+        md = await bf.fetch_markdown_endpoint(f"/api/rebalance{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "rebalance"))
+
+    @group.command(name="compare", description="Relative performance across symbols")
+    @app_commands.describe(symbols="Comma/space-separated tickers, max 8",
+                           duration="Lookback: 5 D | 1 M | 3 M | 6 M | 1 Y")
+    async def compare_cmd(interaction: discord.Interaction, symbols: str,
+                          duration: Optional[str] = None):
+        if not await _guard_channel(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        from urllib.parse import quote_plus
+        syms = ",".join(s.strip().upper() for s in symbols.replace(",", " ").split() if s.strip())
+        if not syms:
+            return await interaction.followup.send("usage: `/gateway compare nvda smh spy`")
+        q = f"?symbols={quote_plus(syms)}"
+        if duration:
+            q += f"&duration={quote_plus(duration)}"
+        md = await bf.fetch_markdown_endpoint(f"/api/compare{q}", bf.mcp_url_from_env())
+        await interaction.followup.send(bf.clean_markdown_for_discord(md, "compare"))
+
     # Register globally; on_ready will copy to the guild for instant availability.
     tree.add_command(group)
 
