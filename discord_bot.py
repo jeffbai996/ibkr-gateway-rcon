@@ -249,8 +249,10 @@ def build_bot() -> discord.Client:
 
         # Clear any skip-files first — a restart is an explicit "bring this
         # back up" action, it shouldn't get swatted by a lingering pause.
+        # Also clear watchdog backoff so a stood-down watchdog resumes duty.
         for gw in targets:
             gc.resume(gw)
+            gc.reset_backoff(watchdog_backoff, gw.name)
 
         # smart_restart_async: fire the restart/start command in a detached
         # session, then poll the port for ~10s. Returns immediately after
@@ -595,6 +597,19 @@ def build_bot() -> discord.Client:
 
     # --- background watchdog loop -----------------------------------------
 
+    # Outage backoff state, shared with /gateway restart (which resets it).
+    watchdog_backoff: dict[str, gc.BackoffState] = {}
+
+    async def _alert_channels(text: str) -> None:
+        """Best-effort alert to the allowed control channels."""
+        for cid in allowed_channels:
+            try:
+                ch = client.get_channel(int(cid))
+                if ch is not None:
+                    await ch.send(text)
+            except Exception:
+                log.exception("watchdog alert send failed for channel %s", cid)
+
     @tasks.loop(seconds=_watchdog_interval())
     async def watchdog():
         try:
@@ -606,12 +621,26 @@ def build_bot() -> discord.Client:
                 cfg.gateways,
                 probe,
                 now,
+                watchdog_backoff,
             )
             for action in actions:
                 gw = cfg.get(action.gateway_name)
                 if gw is None:
                     continue
-                _watchdog_log(cfg, f"port probe failed for {gw.name}, restarting {gw.name} gateway")
+                if action.reason == "gave_up":
+                    msg = (f"{gw.name} still down after final backoff attempt — "
+                           f"watchdog standing down until /gateway restart")
+                    _watchdog_log(cfg, msg)
+                    await _alert_channels(
+                        f"🚨 `{gw.name}` gateway is still down after 4 restart "
+                        f"attempts (immediate, +5m, +10m, +15m). Watchdog is "
+                        f"standing down — if it's stuck on 2FA, approve the "
+                        f"prompt, then run `/gateway restart`."
+                    )
+                    continue
+                attempts = watchdog_backoff.get(gw.name)
+                nth = attempts.attempts if attempts else "?"
+                _watchdog_log(cfg, f"port probe failed for {gw.name}, restarting {gw.name} gateway (attempt {nth}/4)")
                 res = await asyncio.to_thread(gc.restart, gw)
                 _watchdog_log(
                     cfg,

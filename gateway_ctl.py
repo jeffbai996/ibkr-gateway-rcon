@@ -570,13 +570,48 @@ class WatchdogAction:
     reason: str  # e.g. "port_down"
 
 
+@dataclass
+class BackoffState:
+    """Restart-attempt tracking for one gateway during an outage."""
+
+    attempts: int = 0
+    last_attempt: Optional[datetime] = None
+    gave_up_notified: bool = False
+
+
+# Wait between successive restart attempts during one outage: the first
+# restart fires as soon as the port probe fails, then 5/10/15-minute gaps.
+# After the final attempt the watchdog stands down until /gateway restart —
+# restart-storming a gateway that's waiting on a Second Factor prompt just
+# kills the pending 2FA dialog and spawns a new one (2026-07-01 incident).
+BACKOFF_DELAYS = (
+    timedelta(minutes=5),
+    timedelta(minutes=10),
+    timedelta(minutes=15),
+)
+
+
+def reset_backoff(backoff: dict, gateway_name: str) -> None:
+    """Clear outage state for a gateway — called on manual /gateway restart
+    so the watchdog resumes normal duty."""
+    backoff.pop(gateway_name, None)
+
+
 def watchdog_tick(
     gateways: list[GatewayConfig],
     port_listening: Callable[[int], bool],
     now: datetime,
+    backoff: Optional[dict] = None,
 ) -> list[WatchdogAction]:
-    """Pure function: given gateways + current port state + time, decide
+    """Pure-ish function: given gateways + current port state + time, decide
     which restarts to issue.
+
+    With a `backoff` dict (gateway_name -> BackoffState, owned by the caller
+    and mutated here), restart attempts follow BACKOFF_DELAYS and then stop:
+    the tick after the final failed attempt emits a single reason="gave_up"
+    action (for a Discord alert), after which the gateway is left alone until
+    reset_backoff() is called. Without `backoff` (legacy callers), every tick
+    of a down gateway emits a restart action, as before.
 
     Side effect: garbage-collects expired skip-files (same as `is_skipped`).
     """
@@ -585,8 +620,28 @@ def watchdog_tick(
         if is_skipped(gw.skip_file, now=now):
             continue
         if port_listening(gw.port):
+            if backoff is not None:
+                backoff.pop(gw.name, None)
             continue
-        actions.append(WatchdogAction(gateway_name=gw.name, reason="port_down"))
+
+        if backoff is None:
+            actions.append(WatchdogAction(gateway_name=gw.name, reason="port_down"))
+            continue
+
+        state = backoff.setdefault(gw.name, BackoffState())
+        if state.attempts == 0:
+            state.attempts = 1
+            state.last_attempt = now
+            actions.append(WatchdogAction(gateway_name=gw.name, reason="port_down"))
+        elif state.attempts <= len(BACKOFF_DELAYS):
+            wait = BACKOFF_DELAYS[state.attempts - 1]
+            if state.last_attempt is not None and now - state.last_attempt >= wait:
+                state.attempts += 1
+                state.last_attempt = now
+                actions.append(WatchdogAction(gateway_name=gw.name, reason="port_down"))
+        elif not state.gave_up_notified:
+            state.gave_up_notified = True
+            actions.append(WatchdogAction(gateway_name=gw.name, reason="gave_up"))
     return actions
 
 
